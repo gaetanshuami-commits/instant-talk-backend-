@@ -1,37 +1,32 @@
-import express from "express";
-import { WebSocketServer } from "ws";
-import dotenv from "dotenv";
+ws.on("message", (message) => {
+  try {
+    const data = JSON.parse(message.toString());
 
-dotenv.config();
+    // Réception des chunks audio depuis le frontend
+    if (data.type === "audio_chunk") {
+      ws.send(
+        JSON.stringify({
+          type: "ack",
+          receivedBytes: data.audioChunk ? data.audioChunk.length : 0,
+          targetLang: data.targetLang || null
+        })
+      );
+      return;
+    }
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// HTTP server (Railway needs it)
-const server = app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-app.get("/", (req, res) => {
-  res.send("Instant Talk Backend OK ✅");
-});
-
-// WebSocket server
-const wss = new WebSocketServer({ server });
-
-wss.on("connection", (ws) => {
-  console.log("Client connected");
-
-  ws.send(JSON.stringify({ status: "connected", message: "WS OK ✅" }));
-
-  ws.on("message", (message) => {
+    // Fallback : echo simple
     ws.send(
       JSON.stringify({
-        status: "ok",
-        echo: message.toString()
+        type: "echo",
+        echo: data
       })
     );
-  });
-
-  ws.on("close", () => console.log("Client disconnected"));
+  } catch (error) {
+    ws.send(
+      JSON.stringify({
+        type: "error",
+        message: "Invalid JSON"
+      })
+    );
+  }
 });
