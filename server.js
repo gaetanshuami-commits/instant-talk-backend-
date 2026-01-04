@@ -3,116 +3,131 @@ dotenv.config();
 
 import express from "express";
 import http from "http";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import OpenAI from "openai";
 import multer from "multer";
+import pdfParse from "pdf-parse";
 
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
-const pdfParse = require("pdf-parse"); // ✅ évite crash ESM
+// =======================
+// Vérification ENV
+// =======================
+if (!process.env.OPENAI_API_KEY) {
+  console.error("❌ OPENAI_API_KEY manquante");
+  process.exit(1);
+}
 
+// =======================
+// App Express
+// =======================
+const app = express();
+app.use(express.json({ limit: "5mb" }));
+
+const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
-// ===============================
-// APP EXPRESS
-// ===============================
-const app = express();
-app.use(express.json({ limit: "25mb" }));
-
-app.get("/", (_req, res) => {
-  res.status(200).send("Instant Talk Backend OK ✅");
+// =======================
+// OpenAI (APRES dotenv)
+// =======================
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ===============================
-// OPENAI
-// ===============================
-const apiKey = process.env.OPENAI_API_KEY;
-if (!apiKey) {
-  console.error("❌ OPENAI_API_KEY manquante dans Railway Variables");
-}
-const openai = new OpenAI({ apiKey: apiKey || "missing" });
-
-
-// ===============================
-// HTTP SERVER + WS
-// ===============================
-const server = http.createServer(app);
-
+// =======================
+// WebSocket Server
+// =======================
 const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
-  ws.send(JSON.stringify({ type: "status", correspondance: "connecte" }));
+  console.log("✅ WebSocket client connecté");
 
-  ws.on("message", () => {
-    ws.send(JSON.stringify({ type: "ack", correspondance: "ok" }));
+  ws.send(JSON.stringify({
+    type: "status",
+    connected: true
+  }));
+
+  ws.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg.toString());
+      console.log("📩 WS message :", data);
+
+      if (data.type === "ping") {
+        ws.send(JSON.stringify({ type: "pong" }));
+      }
+    } catch (e) {
+      console.error("❌ WS error", e);
+    }
   });
 });
 
-// ===============================
-// TTS
-// ===============================
+// =======================
+// TTS ENDPOINT (OpenAI)
+// =======================
 app.post("/tts", async (req, res) => {
   try {
-    const { text, voice } = req.body || {};
-    if (!text) return res.status(400).json({ error: "text required" });
+    const { text, voice = "alloy" } = req.body;
 
-    const allowed = ["alloy", "nova", "shimmer", "echo", "fable", "onyx"];
-    const v = allowed.includes(voice) ? voice : "alloy";
+    if (!text) {
+      return res.status(400).json({ error: "text missing" });
+    }
 
-    const mp3 = await openai.audio.speech.create({
+    const speech = await openai.audio.speech.create({
       model: "tts-1",
-      voice: v,
-      input: text
+      voice,
+      input: text,
     });
 
-    const buffer = Buffer.from(await mp3.arrayBuffer());
-    res.json({ audioBase64: buffer.toString("base64"), audioMime: "audio/mpeg" });
+    const buffer = Buffer.from(await speech.arrayBuffer());
+
+    res.json({
+      audioBase64: buffer.toString("base64"),
+      mime: "audio/mpeg"
+    });
+
   } catch (err) {
-    console.error("TTS ERROR:", err);
-    res.status(500).json({ error: "tts failed" });
+    console.error("❌ TTS error", err);
+    res.status(500).json({ error: "TTS failed" });
   }
 });
 
-// ===============================
-// TRANSLATE FILE
-// ===============================
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }
-});
+// =======================
+// FILE TRANSLATION
+// =======================
+const upload = multer({ storage: multer.memoryStorage() });
 
 app.post("/translate-file", upload.single("file"), async (req, res) => {
   try {
-    const { text, targetLang } = req.body || {};
-    const file = req.file;
+    let text = req.body.text || "";
 
-    let originalText = text || "";
-
-    if (file && file.mimetype === "application/pdf") {
-      const pdf = await pdfParse(file.buffer); // ✅ pdfParse ici
-      originalText = pdf.text || "";
+    if (req.file) {
+      const pdf = await pdfParse(req.file.buffer);
+      text = pdf.text;
     }
 
-    if (!originalText || !targetLang) {
-      return res.status(400).json({ error: "text/file and targetLang required" });
+    if (!text || !req.body.targetLang) {
+      return res.status(400).json({ error: "Missing data" });
     }
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: `Translate to ${targetLang}. Return only the translated text.` },
-        { role: "user", content: originalText }
-      ],
-      temperature: 0.2
+        { role: "system", content: `Translate to ${req.body.targetLang}` },
+        { role: "user", content: text }
+      ]
     });
 
-    res.json({ translatedText: completion.choices?.[0]?.message?.content || "", targetLang });
-  } catch (err) {
-    console.error("TRANSLATE ERROR:", err);
-    res.status(500).json({ error: "translation failed" });
+    res.json({
+      translatedText: completion.choices[0].message.content
+    });
+
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Translation failed" });
   }
 });
 
+// =======================
+// START SERVER
+// =======================
 server.listen(PORT, () => {
-  console.log("🚀 Backend running on port", PORT);
+  console.log(`🚀 Backend OK on port ${PORT}`);
 });
