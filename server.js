@@ -26,9 +26,12 @@ app.get("/", (_req, res) => {
 // ===============================
 // OPENAI
 // ===============================
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const apiKey = process.env.OPENAI_API_KEY;
+if (!apiKey) {
+  console.error("❌ OPENAI_API_KEY manquante dans Railway Variables");
+}
+const openai = new OpenAI({ apiKey: apiKey || "missing" });
+
 
 // ===============================
 // HTTP SERVER + WS
