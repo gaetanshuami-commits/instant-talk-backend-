@@ -1,27 +1,22 @@
 import express from "express";
 import { WebSocketServer } from "ws";
 import dotenv from "dotenv";
-import fetch from "node-fetch";
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(express.json({ limit: "20mb" }));
+
+const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => res.send("Instant Talk Backend OK ✅"));
 
-/**
- * Endpoint pour traduire un texte (utile pour fichiers / chat)
- * POST /translate-text { text, targetLang }
- */
 app.post("/translate-text", async (req, res) => {
   try {
     const { text, targetLang } = req.body || {};
     if (!text || !targetLang) return res.status(400).json({ error: "Missing text/targetLang" });
 
-    const translatedText = await deeplTranslate(text, targetLang.toUpperCase());
+    const translatedText = await deeplTranslate(text, String(targetLang).toUpperCase());
     res.json({ translatedText });
   } catch (e) {
     res.status(500).json({ error: e.message || "translate-text failed" });
@@ -31,34 +26,22 @@ app.post("/translate-text", async (req, res) => {
 const server = app.listen(PORT, () => console.log("Server running on port", PORT));
 const wss = new WebSocketServer({ server });
 
-// ---------- Helpers ----------
-const b64ToBuffer = (b64) => Buffer.from(b64, "base64");
-const bufferToB64 = (buf) => Buffer.from(buf).toString("base64");
-
-function createWhisperFormData(audioBuffer, mimeType = "audio/webm") {
-  const boundary = "----InstantTalkBoundary" + Date.now();
-  const head =
-    `--${boundary}\r\n` +
-    `Content-Disposition: form-data; name="model"\r\n\r\n` +
-    `whisper-1\r\n` +
-    `--${boundary}\r\n` +
-    `Content-Disposition: form-data; name="file"; filename="audio.webm"\r\n` +
-    `Content-Type: ${mimeType}\r\n\r\n`;
-  const tail = `\r\n--${boundary}--\r\n`;
-  const body = Buffer.concat([Buffer.from(head, "utf8"), audioBuffer, Buffer.from(tail, "utf8")]);
-  return { body, boundary };
+function voiceForLang(lang) {
+  const map = { EN: "alloy", FR: "nova", ES: "alloy", DE: "nova", IT: "alloy", PT: "nova", NL: "alloy", ZH: "alloy", AR: "nova" };
+  return map[lang] || "alloy";
 }
 
-async function whisperTranscribe(audioBuffer) {
-  const { body, boundary } = createWhisperFormData(audioBuffer);
+async function whisperTranscribe(webmBuffer) {
+  const form = new FormData();
+  form.append("model", "whisper-1");
+  form.append("file", new Blob([webmBuffer], { type: "audio/webm" }), "audio.webm");
+
   const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": `multipart/form-data; boundary=${boundary}`,
-    },
-    body,
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+    body: form
   });
+
   if (!r.ok) throw new Error("Whisper error: " + (await r.text()));
   const json = await r.json();
   return json.text || "";
@@ -73,9 +56,9 @@ async function deeplTranslate(text, targetLang) {
     method: "POST",
     headers: {
       Authorization: `DeepL-Auth-Key ${process.env.DEEPL_API_KEY}`,
-      "Content-Type": "application/x-www-form-urlencoded",
+      "Content-Type": "application/x-www-form-urlencoded"
     },
-    body: params.toString(),
+    body: params.toString()
   });
 
   if (!r.ok) throw new Error("DeepL error: " + (await r.text()));
@@ -83,48 +66,26 @@ async function deeplTranslate(text, targetLang) {
   return json.translations?.[0]?.text || "";
 }
 
-/**
- * OpenAI TTS: texte -> audio mp3 base64
- * On choisit une voix selon la langue cible (mapping simple)
- */
-function openaiVoiceForLang(lang) {
-  const map = {
-    EN: "alloy",
-    FR: "nova",
-    ES: "alloy",
-    DE: "nova",
-    IT: "alloy",
-    PT: "nova",
-    NL: "alloy",
-    ZH: "alloy",
-    AR: "nova",
-  };
-  return map[lang] || "alloy";
-}
-
 async function openaiTTS(text, lang) {
-  const voice = openaiVoiceForLang(lang);
   const r = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
       model: "gpt-4o-mini-tts",
-      voice,
+      voice: voiceForLang(lang),
       format: "mp3",
-      input: text,
-    }),
+      input: text
+    })
   });
+
   if (!r.ok) throw new Error("OpenAI TTS error: " + (await r.text()));
-  const audioBuf = Buffer.from(await r.arrayBuffer());
-  return audioBuf;
+  return Buffer.from(await r.arrayBuffer());
 }
 
-// ---------- WebSocket pipeline (audio -> text -> translate -> tts) ----------
 wss.on("connection", (ws) => {
-  // Accumulation de chunks audio par client (produit stable)
   let chunks = [];
   let lastFlush = Date.now();
 
@@ -133,49 +94,40 @@ wss.on("connection", (ws) => {
   ws.on("message", async (raw) => {
     try {
       const data = JSON.parse(raw.toString());
-
       if (data.type !== "audio_chunk") return;
 
-      const targetLang = (data.targetLang || "EN").toUpperCase();
-
-      // base64 chunk audio/webm
-      const buf = b64ToBuffer(data.audioChunk || "");
+      const targetLang = String(data.targetLang || "EN").toUpperCase();
+      const buf = Buffer.from(String(data.audioChunk || ""), "base64");
       if (buf.length) chunks.push(buf);
 
-      // ACK immédiat (front vérifie que ça marche)
+      // ack immédiat
       ws.send(JSON.stringify({ type: "ack", receivedBytes: buf.length }));
 
       const now = Date.now();
       const elapsed = now - lastFlush;
       const totalSize = chunks.reduce((a, b) => a + b.length, 0);
 
-      // On flush toutes ~2.5s (latence raisonnable + stable)
-      if (elapsed < 2500 && totalSize < 600000) return;
+      // flush stable toutes ~2.5s
+      if (elapsed < 2500 && totalSize < 700000) return;
 
       lastFlush = now;
-      const audioBuffer = Buffer.concat(chunks);
+      const webm = Buffer.concat(chunks);
       chunks = [];
 
-      // 1) Transcription
-      const originalText = await whisperTranscribe(audioBuffer);
+      const originalText = await whisperTranscribe(webm);
       if (!originalText.trim()) return;
 
-      // 2) Traduction
       const translatedText = await deeplTranslate(originalText, targetLang);
-
-      // 3) Voix (TTS)
       const audioOut = await openaiTTS(translatedText, targetLang);
 
-      ws.send(
-        JSON.stringify({
-          type: "translation",
-          originalText,
-          translatedText,
-          audio: bufferToB64(audioOut),
-          audioMime: "audio/mpeg",
-          targetLang,
-        })
-      );
+      ws.send(JSON.stringify({
+        type: "translation",
+        originalText,
+        translatedText,
+        audio: audioOut.toString("base64"),
+        audioMime: "audio/mpeg",
+        targetLang
+      }));
     } catch (e) {
       ws.send(JSON.stringify({ type: "error", message: e.message || "error" }));
     }
