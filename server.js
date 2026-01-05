@@ -8,23 +8,24 @@ import multer from "multer";
 import pdfParse from "pdf-parse";
 
 dotenv.config();
+// ===============================
+// OpenAI API KEY (Railway safe)
+// ===============================
 
-const hasOpenAIKey = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
+// Railway doit avoir: OPENAI_API_KEY (sans espace, sans guillemets)
+const OPENAI_KEY = (process.env.OPENAI_API_KEY || "").trim();
+
+// Vérifie juste si elle existe (ne l’affiche pas en clair)
+const hasOpenAIKey = OPENAI_KEY.length > 0;
 console.log("🔑 OPENAI_API_KEY présent :", hasOpenAIKey);
 
-const PORT = process.env.PORT || 8080;
+if (!hasOpenAIKey) {
+  console.error("❌ OPENAI_API_KEY absente dans Railway Variables (OPENAI_API_KEY)");
+}
 
-// --------------------
-// Express + HTTP server
-// --------------------
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "15mb" }));
+// IMPORTANT: on initialise OpenAI avec la bonne clé
+const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
-const server = http.createServer(app);
-
-// --------------------
-// WebSocket server
 // --------------------
 const wss = new WebSocketServer({ server });
 
