@@ -1,39 +1,28 @@
-import dotenv from "dotenv";
-dotenv.config();
-
 import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
+import dotenv from "dotenv";
 import OpenAI from "openai";
 import multer from "multer";
-import pdfParse from "pdf-parse";
+import PDFParse from "pdf-parse";
 
-// =======================
-// Vérification ENV
-// =======================
-if (!process.env.OPENAI_API_KEY) {
-  console.error("❌ OPENAI_API_KEY manquante");
-  process.exit(1);
-}
+dotenv.config();
 
-// =======================
-// App Express
-// =======================
-const app = express();
-app.use(express.json({ limit: "5mb" }));
-
-const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
 // =======================
-// OpenAI (APRES dotenv)
+// Express
 // =======================
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const app = express();
+app.use(express.json({ limit: "10mb" }));
 
 // =======================
-// WebSocket Server
+// HTTP Server (OBLIGATOIRE)
+// =======================
+const server = http.createServer(app);
+
+// =======================
+// WebSocket attaché au serveur HTTP
 // =======================
 const wss = new WebSocketServer({ server });
 
@@ -42,75 +31,90 @@ wss.on("connection", (ws) => {
 
   ws.send(JSON.stringify({
     type: "status",
-    connected: true
+    message: "WebSocket connecté avec succès"
   }));
 
   ws.on("message", (msg) => {
     try {
       const data = JSON.parse(msg.toString());
-      console.log("📩 WS message :", data);
-
-      if (data.type === "ping") {
-        ws.send(JSON.stringify({ type: "pong" }));
-      }
+      console.log("📩 WS message reçu :", data);
     } catch (e) {
-      console.error("❌ WS error", e);
+      console.error("❌ WS JSON invalide");
     }
   });
 });
 
 // =======================
-// TTS ENDPOINT (OpenAI)
+// OpenAI
+// =======================
+if (!process.env.OPENAI_API_KEY) {
+  console.error("❌ OPENAI_API_KEY manquante");
+  process.exit(1);
+}
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+
+// =======================
+// Multer (upload fichiers)
+// =======================
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }
+});
+
+// =======================
+// POST /tts (TEXT → VOIX)
 // =======================
 app.post("/tts", async (req, res) => {
   try {
     const { text, voice = "alloy" } = req.body;
 
     if (!text) {
-      return res.status(400).json({ error: "text missing" });
+      return res.status(400).json({ error: "text required" });
     }
 
-    const speech = await openai.audio.speech.create({
+    const mp3 = await openai.audio.speech.create({
       model: "tts-1",
       voice,
-      input: text,
+      input: text
     });
 
-    const buffer = Buffer.from(await speech.arrayBuffer());
+    const buffer = Buffer.from(await mp3.arrayBuffer());
 
     res.json({
       audioBase64: buffer.toString("base64"),
-      mime: "audio/mpeg"
+      audioMime: "audio/mpeg"
     });
 
   } catch (err) {
-    console.error("❌ TTS error", err);
+    console.error("❌ TTS error:", err.message);
     res.status(500).json({ error: "TTS failed" });
   }
 });
 
 // =======================
-// FILE TRANSLATION
+// POST /translate-file
 // =======================
-const upload = multer({ storage: multer.memoryStorage() });
-
 app.post("/translate-file", upload.single("file"), async (req, res) => {
   try {
-    let text = req.body.text || "";
+    let text = req.body.text;
+    const targetLang = req.body.targetLang;
 
-    if (req.file) {
-      const pdf = await pdfParse(req.file.buffer);
+    if (req.file && req.file.mimetype === "application/pdf") {
+      const pdf = await PDFParse(req.file.buffer);
       text = pdf.text;
     }
 
-    if (!text || !req.body.targetLang) {
-      return res.status(400).json({ error: "Missing data" });
+    if (!text || !targetLang) {
+      return res.status(400).json({ error: "text/file and targetLang required" });
     }
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: `Translate to ${req.body.targetLang}` },
+        { role: "system", content: `Translate to ${targetLang}` },
         { role: "user", content: text }
       ]
     });
@@ -119,15 +123,15 @@ app.post("/translate-file", upload.single("file"), async (req, res) => {
       translatedText: completion.choices[0].message.content
     });
 
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Translation failed" });
+  } catch (err) {
+    console.error("❌ translate-file error:", err.message);
+    res.status(500).json({ error: "translation failed" });
   }
 });
 
 // =======================
-// START SERVER
+// LANCEMENT SERVEUR (LE POINT CRUCIAL)
 // =======================
 server.listen(PORT, () => {
-  console.log(`🚀 Backend OK on port ${PORT}`);
+  console.log(`🚀 Backend Instant Talk actif sur le port ${PORT}`);
 });
