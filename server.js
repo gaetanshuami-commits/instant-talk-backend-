@@ -9,6 +9,9 @@ import pdfParse from "pdf-parse";
 
 dotenv.config();
 
+const hasOpenAIKey = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
+console.log("🔑 OPENAI_API_KEY présent :", hasOpenAIKey);
+
 const PORT = process.env.PORT || 8080;
 
 // --------------------
