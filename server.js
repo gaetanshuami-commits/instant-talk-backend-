@@ -93,13 +93,13 @@ app.post("/tts", async (req, res) => {
 
     const chosenVoice = (voice || "alloy").toString();
 
-    // TTS OpenAI
-    const speech = await openai.audio.speech.create({
-      model: "gpt-4o-mini-tts",
-      voice: chosenVoice,
-      input: String(text),
-      format: "mp3",
-    });
+   const speech = await openai.audio.speech.create({
+  model: "tts-1",
+  voice: chosenVoice,
+  input: String(text),
+  response_format: "mp3",
+});
+
 
     const buffer = Buffer.from(await speech.arrayBuffer());
     return res.json({ audioBase64: buffer.toString("base64") });
