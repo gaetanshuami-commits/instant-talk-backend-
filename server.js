@@ -6,59 +6,79 @@ import OpenAI from "openai";
 dotenv.config();
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "10mb" }));
 
-const PORT = process.env.PORT || 8080;
+// CORS (simple)
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
 
-// 🔑 Vérification clé
-const hasKey = !!process.env.OPENAI_API_KEY;
-console.log("🔑 OPENAI_API_KEY présent :", hasKey);
+app.use(express.json({ limit: "2mb" }));
 
-if (!hasKey) {
-  console.error("❌ OPENAI_API_KEY absente dans Railway");
-}
+// --- Debug env ---
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
+console.log("🔑 OPENAI_API_KEY présent :", Boolean(OPENAI_API_KEY));
 
-// Client OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const client = OPENAI_API_KEY
+  ? new OpenAI({ apiKey: OPENAI_API_KEY })
+  : null;
 
-// Route test
-app.get("/", (req, res) => {
-  res.json({ status: "Backend Instant Talk OK" });
-});
+// --- Routes ---
+app.get("/", (req, res) => res.send("Instant Talk backend OK"));
+app.get("/health", (req, res) =>
+  res.json({
+    ok: true,
+    openai_key_present: Boolean(OPENAI_API_KEY),
+    time: new Date().toISOString(),
+  })
+);
 
-// ✅ ROUTE TTS FONCTIONNELLE
+// TTS: renvoie un MP3
 app.post("/tts", async (req, res) => {
   try {
-    const { text, voice = "alloy" } = req.body;
-
-    if (!text) {
-      return res.status(400).json({ error: "Texte manquant" });
+    if (!client) {
+      return res.status(500).json({
+        error:
+          "OPENAI_API_KEY manquante sur Railway. Ajoute-la dans Variables puis redéploie.",
+      });
     }
 
-    const response = await openai.audio.speech.create({
-      model: "gpt-4o-mini-tts",
-      voice,
-      input: text,
+    const { text, voice } = req.body || {};
+    const safeText = typeof text === "string" ? text.trim() : "";
+
+    if (!safeText) {
+      return res.status(400).json({ error: "Champ 'text' manquant." });
+    }
+
+    const chosenVoice = (typeof voice === "string" && voice.trim()) || "alloy";
+
+    // OpenAI TTS
+    const mp3 = await client.audio.speech.create({
+      model: "tts-1",
+      voice: chosenVoice,
+      input: safeText,
+      format: "mp3",
     });
 
-    const buffer = Buffer.from(await response.arrayBuffer());
+    const buffer = Buffer.from(await mp3.arrayBuffer());
 
-    res.set({
-      "Content-Type": "audio/mpeg",
-      "Content-Length": buffer.length,
-    });
-
-    res.send(buffer);
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", buffer.length);
+    return res.status(200).send(buffer);
   } catch (err) {
-    console.error("❌ Erreur TTS :", err);
-    res.status(500).json({ error: "Erreur TTS serveur" });
+    console.error("❌ /tts error:", err?.message || err);
+    return res.status(500).json({
+      error: "Erreur TTS serveur",
+      details: err?.message || String(err),
+    });
   }
 });
 
-// Lancement serveur
-app.listen(PORT, () => {
-  console.log(`🚀 Backend Instant Talk lancé sur le port ${PORT}`);
+// --- Start ---
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("🚀 Backend Instant Talk lancé sur le port", PORT);
 });
