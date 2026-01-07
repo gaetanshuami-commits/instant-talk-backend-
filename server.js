@@ -16,6 +16,10 @@ app.use(
   })
 );
 
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 app.use(express.json({ limit: "2mb" }));
 
 // --- Debug env ---
