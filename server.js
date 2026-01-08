@@ -1,88 +1,89 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import OpenAI from "openai";
+// =======================
+// 🎤 SPEECH TO TEXT (STT)
+// =======================
 
-dotenv.config();
+window.SpeechRecognition =
+  window.SpeechRecognition || window.webkitSpeechRecognition;
 
-const app = express();
+if (!window.SpeechRecognition) {
+  console.error("❌ SpeechRecognition non supporté");
+} else {
+  const rec = new SpeechRecognition();
 
-// CORS (simple)
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
-  })
-);
+  rec.lang = "fr-FR";
+  rec.interimResults = true;
+  rec.continuous = true;
 
-app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok" });
-});
+  let isManuallyStopped = false;
 
-app.use(express.json({ limit: "2mb" }));
+  // 🎧 Résultats
+  rec.onresult = (e) => {
+    let finalText = "";
+    let interim = "";
 
-// --- Debug env ---
-const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
-console.log("🔑 OPENAI_API_KEY présent :", Boolean(OPENAI_API_KEY));
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const text = e.results[i][0].transcript;
+      if (e.results[i].isFinal) {
+        finalText += text;
+      } else {
+        interim += text;
+      }
+    }
 
-const client = OPENAI_API_KEY
-  ? new OpenAI({ apiKey: OPENAI_API_KEY })
-  : null;
+    if (interim) {
+      console.log("🟡 interim :", interim);
+    }
 
-// --- Routes ---
-app.get("/", (req, res) => res.send("Instant Talk backend OK"));
-app.get("/health", (req, res) =>
-  res.json({
-    ok: true,
-    openai_key_present: Boolean(OPENAI_API_KEY),
-    time: new Date().toISOString(),
-  })
-);
+    if (finalText) {
+      console.log("🟢 final :", finalText);
 
-// TTS: renvoie un MP3
-app.post("/tts", async (req, res) => {
+      // 👉 ICI tu brancheras la traduction + TTS plus tard
+      // sendToTranslate(finalText)
+    }
+  };
+
+  // ❌ Erreurs
+  rec.onerror = (e) => {
+    console.log("❌ erreur STT :", e.error);
+
+    if (e.error === "no-speech") {
+      try {
+        rec.stop();
+      } catch {}
+    }
+  };
+
+  // 🔁 Relance automatique PROPRE
+  rec.onend = () => {
+    if (isManuallyStopped) return;
+
+    console.log("🔁 STT relancé...");
+    setTimeout(() => {
+      try {
+        rec.start();
+      } catch {}
+    }, 1200); // délai important
+  };
+
+  // ▶️ Démarrage
   try {
-    if (!client) {
-      return res.status(500).json({
-        error:
-          "OPENAI_API_KEY manquante sur Railway. Ajoute-la dans Variables puis redéploie.",
-      });
-    }
-
-    const { text, voice } = req.body || {};
-    const safeText = typeof text === "string" ? text.trim() : "";
-
-    if (!safeText) {
-      return res.status(400).json({ error: "Champ 'text' manquant." });
-    }
-
-    const chosenVoice = (typeof voice === "string" && voice.trim()) || "alloy";
-
-    // OpenAI TTS
-    const mp3 = await client.audio.speech.create({
-      model: "tts-1",
-      voice: chosenVoice,
-      input: safeText,
-      format: "mp3",
-    });
-
-    const buffer = Buffer.from(await mp3.arrayBuffer());
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Content-Length", buffer.length);
-    return res.status(200).send(buffer);
-  } catch (err) {
-    console.error("❌ /tts error:", err?.message || err);
-    return res.status(500).json({
-      error: "Erreur TTS serveur",
-      details: err?.message || String(err),
-    });
+    rec.start();
+    console.log("🎤 STT démarré : parle maintenant");
+  } catch (e) {
+    console.error("❌ Impossible de démarrer STT", e);
   }
-});
 
-// --- Start ---
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("🚀 Backend Instant Talk lancé sur le port", PORT);
-});
+  // Expose pour debug si besoin
+  window.__stt = {
+    stop: () => {
+      isManuallyStopped = true;
+      rec.stop();
+      console.log("⏹️ STT arrêté manuellement");
+    },
+    start: () => {
+      isManuallyStopped = false;
+      rec.start();
+      console.log("▶️ STT relancé manuellement");
+    }
+  };
+}
