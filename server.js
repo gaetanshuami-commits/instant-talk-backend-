@@ -1,108 +1,67 @@
-// ===============================
-// 🎤 STT + 🔊 TTS – Instant Talk
-// ===============================
+import express from "express";
+import cors from "cors";
+import OpenAI from "openai";
 
-// -------- CONFIG --------
-const BACKEND_TTS_URL =
-  "https://instant-talk-backend-production.up.railway.app/tts";
+const app = express();
 
-// -------- STT (Speech to Text) --------
-const SpeechRecognition =
-  window.SpeechRecognition || window.webkitSpeechRecognition;
+// --- middleware ---
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
 
-if (!SpeechRecognition) {
-  console.error("❌ SpeechRecognition non supporté par ce navigateur");
-} else {
-  const rec = new SpeechRecognition();
+// --- OpenAI (backend only) ---
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+if (!OPENAI_API_KEY) console.error("❌ OPENAI_API_KEY manquante dans Railway");
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-  rec.lang = "fr-FR";
-  rec.interimResults = true;
-  rec.continuous = true;
+// --- health ---
+app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
-  let isSpeaking = false;
-  let restartTimeout = null;
-
-  rec.onstart = () => {
-    console.log("🎤 STT démarré : parle maintenant");
-  };
-
-  rec.onresult = (e) => {
-    let finalText = "";
-    let interimText = "";
-
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const t = e.results[i][0].transcript;
-      if (e.results[i].isFinal) finalText += t;
-      else interimText += t;
-    }
-
-    if (interimText) {
-      console.log("🟡 interim:", interimText);
-    }
-
-    if (finalText) {
-      console.log("🟢 final:", finalText);
-      speak(finalText);
-    }
-  };
-
-  rec.onerror = (e) => {
-    console.log("❌ erreur STT:", e.error);
-
-    // on évite les boucles infinies
-    if (e.error === "no-speech") {
-      try {
-        rec.stop();
-      } catch {}
-    }
-  };
-
-  rec.onend = () => {
-    console.log("🔁 STT relancé (attente)");
-    clearTimeout(restartTimeout);
-    restartTimeout = setTimeout(() => {
-      try {
-        rec.start();
-      } catch {}
-    }, 1500); // délai important
-  };
-
-  // Démarrage
+// --- translate ---
+app.post("/translate", async (req, res) => {
   try {
-    rec.start();
-  } catch {}
-}
+    const { text, target = "en" } = req.body || {};
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({ error: "texte manquant" });
+    }
 
-// -------- TTS (Text to Speech via backend) --------
-function speak(text) {
-  if (!text || text.trim().length === 0) return;
-
-  fetch(BACKEND_TTS_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      text,
-      voice: "alloy",
-    }),
-  })
-    .then((r) => r.blob())
-    .then((blob) => {
-      const audioUrl = URL.createObjectURL(blob);
-      const audio = new Audio(audioUrl);
-      audio.play();
-      console.log("🔊 TTS audio joué");
-    })
-    .catch((err) => {
-      console.error("❌ Erreur TTS:", err);
+    const r = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        { role: "system", content: "Traduis. Réponds uniquement par la traduction finale." },
+        { role: "user", content: `Traduis en ${target} : ${text}` }
+      ],
     });
-}
 
-// -------- TEST MICRO --------
-navigator.mediaDevices
-  .getUserMedia({ audio: true })
-  .then(() => console.log("🎙️ Micro autorisé OK"))
-  .catch((e) =>
-    console.error("❌ Micro bloqué:", e.name, e.message)
-  );
+    res.json({ translated: (r.output_text || "").trim() });
+  } catch (e) {
+    console.error("❌ translate:", e?.message || e);
+    res.status(500).json({ error: "Erreur traduction serveur", details: String(e?.message || e) });
+  }
+});
+
+// --- TTS (mp3) ---
+app.post("/tts", async (req, res) => {
+  try {
+    const { text, voice = "alloy" } = req.body || {};
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({ error: "texte manquant" });
+    }
+
+    const audio = await openai.audio.speech.create({
+      model: "gpt-4o-mini-tts",
+      voice,
+      input: text,
+      format: "mp3",
+    });
+
+    const buf = Buffer.from(await audio.arrayBuffer());
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.send(buf);
+  } catch (e) {
+    console.error("❌ tts:", e?.message || e);
+    res.status(500).json({ error: "Erreur TTS serveur", details: String(e?.message || e) });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("✅ Backend OK sur port", PORT));
