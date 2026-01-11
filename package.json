@@ -2,9 +2,7 @@
   "name": "instant-talk-backend",
   "version": "1.0.0",
   "type": "module",
-  "engines": {
-    "node": ">=18"
-  },
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
@@ -12,7 +10,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.18.2",
-    "openai": "^4.0.0",
-    "ws": "^8.16.0"
+    "socket.io": "^4.7.5",
+    "ws": "^8.17.1"
   }
 }
