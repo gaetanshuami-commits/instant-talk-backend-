@@ -75,7 +75,58 @@ wss.on("connection", (ws) => {
           received: true,
           bytes: data.audioChunk?.length || 0
         }));
-      }
+      if (data.type === "translate_tts") {
+  const text = data.text || "";
+  const targetLang = data.targetLang || "en";
+  const voice = data.voice || "alloy";
+
+  if (!text) {
+    ws.send(JSON.stringify({ type: "error", error: "text manquant" }));
+    return;
+  }
+
+  // 1) translate (OpenAI)
+  const out = await openaiJson("https://api.openai.com/v1/responses", {
+    model: process.env.OPENAI_TRANSLATE_MODEL || "gpt-4.1-mini",
+    input: `Traduis en ${targetLang}. Réponds uniquement avec la traduction.\n\nTexte: ${text}`
+  });
+
+  const translated =
+    out.output_text ||
+    (out.output?.[0]?.content?.[0]?.text) ||
+    "";
+
+  // 2) tts (OpenAI)
+  const ttsResp = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts",
+      voice,
+      input: translated,
+      format: "mp3"
+    })
+  });
+
+  if (!ttsResp.ok) {
+    const t = await ttsResp.text();
+    ws.send(JSON.stringify({ type: "error", error: "tts_failed", details: t }));
+    return;
+  }
+
+  const audioBuf = Buffer.from(await ttsResp.arrayBuffer());
+
+  ws.send(JSON.stringify({
+    type: "translation",
+    originalText: text,
+    translatedText: translated,
+    audioBase64: audioBuf.toString("base64")
+  }));
+}
+
     } catch (err) {
       ws.send(JSON.stringify({ error: "invalid_json" }));
     }
