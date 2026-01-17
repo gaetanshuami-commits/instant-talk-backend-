@@ -1,260 +1,210 @@
-// server.js (CommonJS) — Instant Talk Backend (Google Cloud STT + Translate + TTS)
-// ✅ Railway-ready
-// ✅ WebRTC signaling via Socket.io
-// ✅ WebSocket streaming /ws/rt for audio_chunk (WEBM_OPUS)
-// ✅ Returns {type:"translation", originalText, translatedText, audioBase64}
+import fs from "fs";
+import os from "os";
+import path from "path";
+import http from "http";
+import express from "express";
+import { WebSocketServer } from "ws";
 
-const fs = require("fs");
-const path = require("path");
-const express = require("express");
-const http = require("http");
-const cors = require("cors");
-const { Server } = require("socket.io");
-const WebSocket = require("ws");
+import { SpeechClient } from "@google-cloud/speech";
+import textToSpeech from "@google-cloud/text-to-speech";
+import * as deepl from "deepl-node";
 
-const speech = require("@google-cloud/speech");
-const { Translate } = require("@google-cloud/translate").v2;
-const tts = require("@google-cloud/text-to-speech");
-
-// -------------------- ENV / GOOGLE CREDS --------------------
 /**
- * Railway Variables à ajouter :
- * GOOGLE_APPLICATION_CREDENTIALS_JSON = (contenu JSON du service account)
+ * ENV attendues (Railway):
+ * - PORT (Railway le fournit)
+ * - DEEPL_API_KEY
+ * - GOOGLE_APPLICATION_CREDENTIALS_JSON  (recommandé)  OU  GOOGLE_APPLICATION_CREDENTIALS (chemin fichier) OU (ton ancienne variable)
+ *
+ * Important:
+ * Sur Railway, le plus simple est de coller le JSON de service account dans GOOGLE_APPLICATION_CREDENTIALS_JSON.
  */
-if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
-  const credPath = path.join(__dirname, "google-credentials.json");
-  if (!fs.existsSync(credPath)) {
-    fs.writeFileSync(credPath, process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON, "utf8");
+
+// --- Google credentials helper (JSON en variable) ---
+function ensureGoogleCredentialsFileFromEnv() {
+  // Supporte plusieurs noms possibles (vu ta variable tronquée dans Railway)
+  const json =
+    process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON ||
+    process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON_STRING ||
+    process.env.GOOGLE_APPLICATION_CREDENTIALIALS_JSON || // faute possible
+    process.env.GOOGLE_APPLICATION_CREDENTIALIALS ||      // vu dans ta capture (tronqué)
+    process.env.GOOGLE_APPLICATION_CREDENTIALS_INLINE;
+
+  if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && json) {
+    const filePath = path.join(os.tmpdir(), "gcp-creds.json");
+    fs.writeFileSync(filePath, json, "utf8");
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = filePath;
   }
-  process.env.GOOGLE_APPLICATION_CREDENTIALS = credPath;
 }
 
-// -------------------- APP --------------------
-const app = express();
-app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
-app.use(express.json({ limit: "5mb" }));
+ensureGoogleCredentialsFileFromEnv();
 
-app.get("/", (_req, res) => res.send("Instant Talk backend OK ✅"));
-app.get("/health", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
+const app = express();
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, wsPath: "/ws" });
+});
 
 const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws" });
 
-// -------------------- SOCKET.IO (WebRTC signaling) --------------------
-const io = new Server(server, { cors: { origin: "*" } });
+// --- Clients ---
+const speechClient = new SpeechClient();
+const ttsClient = new textToSpeech.TextToSpeechClient();
 
-io.on("connection", (socket) => {
-  console.log("🟢 socket connected:", socket.id);
+const deeplKey = process.env.DEEPL_API_KEY;
+const deeplTranslator = deeplKey ? new deepl.Translator(deeplKey) : null;
 
-  socket.on("join-room", (roomId) => {
-    if (!roomId) return;
-    socket.join(roomId);
-    socket.to(roomId).emit("user-joined", socket.id);
-  });
-
-  socket.on("offer", (roomId, offer) => socket.to(roomId).emit("offer", offer, socket.id));
-  socket.on("answer", (roomId, answer) => socket.to(roomId).emit("answer", answer, socket.id));
-  socket.on("ice-candidate", (roomId, candidate) =>
-    socket.to(roomId).emit("ice-candidate", candidate, socket.id)
-  );
-
-  socket.on("leave-room", (roomId) => {
-    socket.leave(roomId);
-    socket.to(roomId).emit("user-left", socket.id);
-  });
-
-  socket.on("disconnect", () => console.log("🔴 socket disconnected:", socket.id));
-});
-
-// -------------------- GOOGLE CLIENTS --------------------
-const sttClient = new speech.SpeechClient();
-const translateClient = new Translate();
-const ttsClient = new tts.TextToSpeechClient();
-
-// -------------------- SIMPLE CACHE (memory) --------------------
-const cache = new Map(); // key => translation
-function cacheGet(k) {
-  const v = cache.get(k);
-  return v;
-}
-function cacheSet(k, v) {
-  if (cache.size > 500) {
-    // purge simple
-    const firstKey = cache.keys().next().value;
-    cache.delete(firstKey);
-  }
-  cache.set(k, v);
+function mapToDeeplLang(lang) {
+  // DeepL attend souvent des codes spécifiques (ex: EN-US, EN-GB)
+  // Ici on garde simple. Tu peux enrichir.
+  const upper = String(lang || "").toUpperCase();
+  if (upper === "EN") return "EN-US";
+  return upper;
 }
 
-// -------------------- WEBSOCKET /ws/rt --------------------
-const wss = new WebSocket.Server({ noServer: true });
+function mapToGoogleLang(lang) {
+  // Google STT/TTS attend plutôt "fr-FR", "en-US", etc.
+  const l = String(lang || "").toLowerCase();
+  if (l === "fr") return "fr-FR";
+  if (l === "en") return "en-US";
+  if (l === "es") return "es-ES";
+  if (l === "de") return "de-DE";
+  if (l === "it") return "it-IT";
+  if (l === "pt") return "pt-PT";
+  if (l === "ar") return "ar-XA";
+  if (l === "ja") return "ja-JP";
+  if (l === "ko") return "ko-KR";
+  if (l === "zh") return "cmn-CN";
+  // fallback: tente xx-XX
+  const parts = l.split("-");
+  if (parts.length === 2) return `${parts[0]}-${parts[1].toUpperCase()}`;
+  return `${l}-${l.toUpperCase()}`;
+}
 
-server.on("upgrade", (req, socket, head) => {
-  const url = req.url || "";
-  if (!url.startsWith("/ws/rt")) {
-    socket.destroy();
-    return;
-  }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-});
+function chooseSttEncoding(audioFormat) {
+  // Tu envoies des chunks base64: souvent MediaRecorder => webm/opus.
+  // Google STT supporte WEBM_OPUS / OGG_OPUS en streaming.
+  // Sinon PCM brut => LINEAR16.
+  const f = String(audioFormat || "").toLowerCase();
+
+  if (f.includes("webm")) return "WEBM_OPUS";
+  if (f.includes("ogg")) return "OGG_OPUS";
+  if (f.includes("linear16") || f.includes("pcm")) return "LINEAR16";
+
+  // défaut: webm opus (le plus probable dans un navigateur)
+  return "WEBM_OPUS";
+}
+
+function base64ToBuffer(b64) {
+  return Buffer.from(b64, "base64");
+}
+
+async function translateText(text, fromLang, toLang) {
+  if (!text || !text.trim()) return "";
+  if (!deeplTranslator) return text; // fallback: pas de DeepL => renvoie le texte brut
+
+  // DeepL auto-detect possible, mais on passe le target
+  const target = mapToDeeplLang(toLang);
+
+  // Optional: sourceLang (si tu veux forcer)
+  // const source = mapToDeeplLang(fromLang);
+
+  const result = await deeplTranslator.translateText(text, null, target);
+  return result?.text || "";
+}
+
+async function synthesizeTTS(text, toLang) {
+  // Sortie audio: MP3 (facile à jouer partout)
+  const languageCode = mapToGoogleLang(toLang);
+
+  const request = {
+    input: { text },
+    voice: { languageCode }, // tu peux choisir une voix plus tard
+    audioConfig: { audioEncoding: "MP3" }
+  };
+
+  const [response] = await ttsClient.synthesizeSpeech(request);
+  const audioContent = response.audioContent; // Buffer
+  return Buffer.isBuffer(audioContent) ? audioContent : Buffer.from(audioContent || []);
+}
+
+/**
+ * PROTOCOLE WS:
+ * 1) client -> {"type":"start","from":"fr","to":"en","audioFormat":"webm/opus","sampleRate":48000}
+ * 2) client -> {"type":"audio","data":"<base64>"}
+ * 3) server -> {"type":"stt","text":"...","final":true}
+ * 4) server -> {"type":"translation","text":"..."}
+ * 5) server -> {"type":"tts","mime":"audio/mpeg","data":"<base64 mp3>"}
+ * 6) client -> {"type":"stop"}
+ */
 
 wss.on("connection", (ws) => {
-  console.log("🎧 WS client connected");
+  const state = {
+    started: false,
+    from: "fr",
+    to: "en",
+    audioFormat: "webm/opus",
+    sampleRate: 48000,
+    sttStream: null,
+    lastFinalText: "",
+    isProcessingFinal: false
+  };
 
-  // Un stream STT par client WS
-  let sttStream = null;
-  let currentTarget = "en";
-  let currentSource = "fr-FR";
+  function safeSend(obj) {
+    try {
+      ws.send(JSON.stringify(obj));
+    } catch {}
+  }
+
+  function closeSttStream() {
+    try {
+      if (state.sttStream) {
+        state.sttStream.end();
+        state.sttStream.removeAllListeners();
+        state.sttStream = null;
+      }
+    } catch {
+      state.sttStream = null;
+    }
+  }
 
   function startSttStream() {
-    // IMPORTANT: streamingRecognize pour chunks
-    sttStream = sttClient
-      .streamingRecognize({
-        config: {
-          encoding: "WEBM_OPUS",
-          sampleRateHertz: 48000,
-          languageCode: currentSource || "fr-FR",
-          enableAutomaticPunctuation: true
-          // Option: alternativeLanguageCodes: ["en-US","es-ES",...]
-        },
-        interimResults: true
-      })
+    closeSttStream();
+
+    const encoding = chooseSttEncoding(state.audioFormat);
+    const languageCode = mapToGoogleLang(state.from);
+
+    const request = {
+      config: {
+        encoding,
+        sampleRateHertz: state.sampleRate,
+        languageCode,
+        enableAutomaticPunctuation: true
+      },
+      interimResults: true
+    };
+
+    const recognizeStream = speechClient
+      .streamingRecognize(request)
       .on("error", (err) => {
-        console.error("❌ STT stream error:", err.message || err);
-        try {
-          ws.send(JSON.stringify({ type: "error", message: "stt_stream_error", details: String(err.message || err) }));
-        } catch {}
-        try { sttStream.destroy(); } catch {}
-        sttStream = null;
+        safeSend({ type: "error", message: `STT error: ${String(err?.message || err)}` });
       })
       .on("data", async (data) => {
         try {
           const result = data.results?.[0];
-          if (!result) return;
+          const alt = result?.alternatives?.[0];
+          const transcript = alt?.transcript || "";
+          const isFinal = Boolean(result?.isFinal);
 
-          const transcript = result.alternatives?.[0]?.transcript || "";
-          const isFinal = !!result.isFinal;
-
-          // On envoie aussi des sous-titres interim si tu veux (optionnel)
-          ws.send(JSON.stringify({
-            type: "stt",
-            text: transcript,
-            isFinal
-          }));
-
-          if (!isFinal) return;
-          if (!transcript.trim()) return;
-
-          // Translate (cache)
-          const key = `${currentTarget}::${transcript}`;
-          let translated = cacheGet(key);
-          if (!translated) {
-            const [t] = await translateClient.translate(transcript, currentTarget);
-            translated = t || "";
-            cacheSet(key, translated);
+          if (transcript) {
+            safeSend({ type: "stt", text: transcript, final: isFinal });
           }
 
-          // TTS (mp3)
-          const [ttsResp] = await ttsClient.synthesizeSpeech({
-            input: { text: translated },
-            voice: { languageCode: mapLangToTts(currentTarget), ssmlGender: "NEUTRAL" },
-            audioConfig: { audioEncoding: "MP3", speakingRate: 1.0, pitch: 0.0 }
-          });
+          // Quand final -> traduction + TTS
+          if (isFinal && transcript && !state.isProcessingFinal) {
+            // évite doublons
+            if (transcript.trim() === state.lastFinalText.trim()) return;
+            state.lastFinalText = transcript;
 
-          const audioBase64 = Buffer.from(ttsResp.audioContent).toString("base64");
-
-          ws.send(JSON.stringify({
-            type: "translation",
-            correspondance: Date.now(),
-            originalText: transcript,
-            translatedText: translated,
-            audioBase64
-          }));
-        } catch (err) {
-          console.error("❌ pipeline error:", err.message || err);
-          try {
-            ws.send(JSON.stringify({ type: "error", message: "pipeline_error", details: String(err.message || err) }));
-          } catch {}
-        }
-      });
-  }
-
-  function mapLangToTts(lang) {
-    // mapping simple (à étendre)
-    const m = {
-      fr: "fr-FR",
-      en: "en-US",
-      es: "es-ES",
-      de: "de-DE",
-      it: "it-IT",
-      pt: "pt-PT",
-      nl: "nl-NL",
-      zh: "cmn-CN",
-      ar: "ar-SA"
-    };
-    return m[lang] || "en-US";
-  }
-
-  ws.on("message", (raw) => {
-    let data;
-    try {
-      data = JSON.parse(raw.toString("utf8"));
-    } catch {
-      ws.send(JSON.stringify({ type: "error", message: "invalid_json" }));
-      return;
-    }
-
-    // Le frontend doit envoyer au moins une fois config (ou on garde defaults)
-    if (data.type === "config") {
-      currentTarget = (data.targetLang || "en").toString();
-      currentSource = (data.sourceLang || "fr-FR").toString();
-
-      // redémarrer stream si déjà actif (pour changer langue STT)
-      if (sttStream) {
-        try { sttStream.destroy(); } catch {}
-        sttStream = null;
-      }
-      startSttStream();
-
-      ws.send(JSON.stringify({ type: "ack", message: "config_ok", target: currentTarget, source: currentSource }));
-      return;
-    }
-
-    if (data.type === "audio_chunk") {
-      const chunkB64 = data.audioChunk;
-      if (!chunkB64) {
-        ws.send(JSON.stringify({ type: "ack", bytesReceived: 0 }));
-        return;
-      }
-
-      // démarrer stream si pas démarré
-      if (!sttStream) startSttStream();
-
-      // écrire le chunk
-      const audioBytes = Buffer.from(chunkB64, "base64");
-      try {
-        sttStream.write(audioBytes);
-      } catch (err) {
-        console.error("❌ stt write error:", err.message || err);
-      }
-
-      ws.send(JSON.stringify({ type: "ack", bytesReceived: audioBytes.length }));
-      return;
-    }
-
-    ws.send(JSON.stringify({ type: "error", message: "unknown_type", got: data.type }));
-  });
-
-  ws.on("close", () => {
-    console.log("🔴 WS client disconnected");
-    try { sttStream && sttStream.destroy(); } catch {}
-    sttStream = null;
-  });
-
-  ws.on("error", (err) => {
-    console.error("❌ WS error:", err.message || err);
-  });
-});
-
-// -------------------- START --------------------
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log("🚀 Server running on", PORT));
+            state.isProcessingFinal = true;
+            try {
+              const translated = await translateText(transcript, state.from, state.t
