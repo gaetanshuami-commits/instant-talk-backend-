@@ -13,10 +13,10 @@ import * as deepl from "deepl-node";
  * ENV (Railway)
  * - PORT
  * - DEEPL_API_KEY
- * - GOOGLE_APPLICATION_CREDENTIALS_JSON  (JSON brut complet du service account)  ✅ recommandé
+ * - GOOGLE_APPLICATION_CREDENTIALS_JSON  ✅ (JSON brut complet du service account)
  *   ou GOOGLE_CLOUD_CREDENTIALS          (fallback)
  *
- * WS PROTOCOL
+ * WS PROTOCOL (JSON)
  * Client -> {type:"start", from:"fr", to:"en", audioFormat:"webm/opus", sampleRate:48000}
  * Client -> {type:"audio", data:"<base64 chunk>"}
  * Client -> {type:"stop"}
@@ -29,43 +29,37 @@ import * as deepl from "deepl-node";
  * Server -> {type:"error", message:"..."}
  */
 
-// ---------- Google credentials bootstrap (MOST IMPORTANT) ----------
+// -------------------- Google credentials bootstrap --------------------
 function ensureGoogleCredentialsFileFromEnv() {
-  // Supporte 2 noms de variable (Base44 mentionne GOOGLE_CLOUD_CREDENTIALS)
   const json =
     process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON ||
     process.env.GOOGLE_CLOUD_CREDENTIALS;
 
   if (!json) {
     console.warn(
-      "⚠️ No Google credentials JSON found in env. Set GOOGLE_APPLICATION_CREDENTIALS_JSON (recommended)."
+      "⚠️ Missing Google credentials JSON. Set GOOGLE_APPLICATION_CREDENTIALS_JSON in Railway."
     );
     return;
   }
 
-  // Si déjà un chemin fichier est défini, on le garde
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    return;
-  }
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) return;
 
-  // Écrit le JSON dans un fichier temporaire
   const filePath = path.join(os.tmpdir(), "gcp-creds.json");
   fs.writeFileSync(filePath, json, "utf8");
   process.env.GOOGLE_APPLICATION_CREDENTIALS = filePath;
-
-  console.log("✅ Google credentials file created at:", filePath);
+  console.log("✅ Google credentials file ready:", filePath);
 }
 
 ensureGoogleCredentialsFileFromEnv();
 
-// ---------- Clients ----------
+// -------------------- Clients --------------------
 const speechClient = new SpeechClient();
 const ttsClient = new textToSpeech.TextToSpeechClient();
 
 const deeplKey = process.env.DEEPL_API_KEY;
 const deeplTranslator = deeplKey ? new deepl.Translator(deeplKey) : null;
 
-// ---------- Helpers ----------
+// -------------------- Helpers --------------------
 function mapToDeeplLang(lang) {
   const upper = String(lang || "").toUpperCase();
   if (upper === "EN") return "EN-US";
@@ -86,20 +80,26 @@ function mapToGoogleLang(lang) {
   if (l === "ko") return "ko-KR";
   if (l === "zh") return "cmn-CN";
 
-  // Si déjà format xx-YY
+  // if already xx-YY
   const parts = l.split("-");
   if (parts.length === 2) return `${parts[0]}-${parts[1].toUpperCase()}`;
 
-  // fallback
   return `${l}-${l.toUpperCase()}`;
 }
 
-function chooseSttEncoding(audioFormat) {
+function normalizeAudioFormat(audioFormat) {
   const f = String(audioFormat || "").toLowerCase();
-  if (f.includes("webm")) return "WEBM_OPUS";
-  if (f.includes("ogg")) return "OGG_OPUS";
-  if (f.includes("linear16") || f.includes("pcm")) return "LINEAR16";
-  return "WEBM_OPUS"; // default navigateur
+  if (f.includes("webm")) return "webm/opus";
+  if (f.includes("ogg")) return "ogg/opus";
+  if (f.includes("linear16") || f.includes("pcm")) return "linear16";
+  return "webm/opus"; // default navigateur
+}
+
+function chooseSttEncoding(normalizedFormat) {
+  if (normalizedFormat === "webm/opus") return "WEBM_OPUS";
+  if (normalizedFormat === "ogg/opus") return "OGG_OPUS";
+  if (normalizedFormat === "linear16") return "LINEAR16";
+  return "WEBM_OPUS";
 }
 
 async function translateText(text, toLang) {
@@ -128,7 +128,7 @@ async function synthesizeTTS(text, toLang) {
     : Buffer.from(audioContent || "");
 }
 
-// ---------- HTTP server ----------
+// -------------------- HTTP server --------------------
 const app = express();
 
 app.get("/health", (_req, res) => {
@@ -138,13 +138,13 @@ app.get("/health", (_req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-// ---------- WebSocket ----------
+// -------------------- WebSocket logic --------------------
 wss.on("connection", (ws) => {
   const state = {
     started: false,
     from: "fr",
     to: "en",
-    audioFormat: "webm/opus",
+    audioFormat: "webm/opus", // normalized
     sampleRate: 48000,
     sttStream: null,
     lastFinal: "",
@@ -170,18 +170,27 @@ wss.on("connection", (ws) => {
   const openStt = () => {
     closeStt();
 
-    const encoding = chooseSttEncoding(state.audioFormat);
     const languageCode = mapToGoogleLang(state.from);
+    const encoding = chooseSttEncoding(state.audioFormat);
 
-    const request = {
-      config: {
-        encoding,
-        sampleRateHertz: state.sampleRate,
-        languageCode,
-        enableAutomaticPunctuation: true,
-      },
-      interimResults: true,
-    };
+    // ✅ FIX IMPORTANT:
+    // Pour WEBM_OPUS / OGG_OPUS, on évite d’imposer sampleRateHertz
+    // car le conteneur Opus peut ne pas correspondre à la valeur annoncée.
+    const config =
+      encoding === "LINEAR16"
+        ? {
+            encoding,
+            sampleRateHertz: Number(state.sampleRate || 16000),
+            languageCode,
+            enableAutomaticPunctuation: true,
+          }
+        : {
+            encoding,
+            languageCode,
+            enableAutomaticPunctuation: true,
+          };
+
+    const request = { config, interimResults: true };
 
     state.sttStream = speechClient
       .streamingRecognize(request)
@@ -245,7 +254,7 @@ wss.on("connection", (ws) => {
       if (msg.type === "start") {
         state.from = msg.from || state.from;
         state.to = msg.to || state.to;
-        state.audioFormat = msg.audioFormat || state.audioFormat;
+        state.audioFormat = normalizeAudioFormat(msg.audioFormat || state.audioFormat);
         state.sampleRate = Number(msg.sampleRate || state.sampleRate);
 
         state.started = true;
@@ -270,10 +279,7 @@ wss.on("connection", (ws) => {
         return;
       }
     } catch (e) {
-      send({
-        type: "error",
-        message: `Bad message: ${String(e?.message || e)}`,
-      });
+      send({ type: "error", message: `Bad message: ${String(e?.message || e)}` });
     }
   });
 
@@ -285,7 +291,7 @@ wss.on("connection", (ws) => {
   send({ type: "hello", message: "WS connected" });
 });
 
-// ---------- Start ----------
+// -------------------- Start server --------------------
 const port = Number(process.env.PORT || 3000);
 server.listen(port, () => {
   console.log(`✅ Server listening on ${port}`);
