@@ -1,269 +1,186 @@
-import express from "express";
-import http from "http";
-import cors from "cors";
-import dotenv from "dotenv";
-import { WebSocketServer } from "ws";
+import express from 'express'
+import http from 'http'
+import cors from 'cors'
+import { WebSocketServer } from 'ws'
+import dotenv from 'dotenv'
+import OpenAI from 'openai'
+import fetch from 'node-fetch'
+import fs from 'fs'
+import path from 'path'
 
-dotenv.config();
+dotenv.config()
 
-const app = express();
-app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: "5mb" }));
+// ================= CONFIG =================
 
-const server = http.createServer(app);
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8080
+const OPENAI_KEY = process.env.OPENAI_API_KEY
+const DEEPL_KEY = process.env.DEEPL_API_KEY
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error("❌ OPENAI_API_KEY manquante dans Railway Variables");
-}
+if (!OPENAI_KEY) throw new Error('OPENAI_API_KEY missing')
+if (!DEEPL_KEY) throw new Error('DEEPL_API_KEY missing')
 
-// -------------------- HEALTH --------------------
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    status: "ok",
-    wsPath: "/ws",
-    timestamp: Date.now(),
-  });
-});
+// ================= INIT =================
 
-// -------------------- HELPERS --------------------
-function safeJsonParse(str) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return null;
-  }
-}
+const app = express()
+app.use(cors())
+app.use(express.json())
 
-function normalizeLang(lang) {
-  if (!lang) return "en";
-  return String(lang).toLowerCase().split("-")[0]; // fr-FR => fr
-}
+const server = http.createServer(app)
+const openai = new OpenAI({ apiKey: OPENAI_KEY })
 
-function b64ToBuffer(b64) {
-  return Buffer.from(b64, "base64");
-}
+// ================= HEALTH =================
 
-async function openaiTranscribeWebm(buffer, fromLang = "fr") {
-  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    wsPath: '/ws',
+    timestamp: Date.now()
+  })
+})
 
-  // Node 18+ : FormData, Blob disponibles globalement
-  const form = new FormData();
-  const blob = new Blob([buffer], { type: "audio/webm" });
+// ================= WEBSOCKET =================
 
-  form.append("file", blob, "audio.webm");
-  form.append("model", "whisper-1");
-  // language est optionnel, mais aide la stabilité
-  form.append("language", normalizeLang(fromLang));
+const wss = new WebSocketServer({
+  server,
+  path: '/ws'
+})
 
-  const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
+console.log('✅ WebSocket path registered: /ws')
+
+// ================= HELPERS =================
+
+async function translateDeepL(text, from, to) {
+  const res = await fetch('https://api-free.deepl.com/v2/translate', {
+    method: 'POST',
     headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Authorization': `DeepL-Auth-Key ${DEEPL_KEY}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
     },
-    body: form,
-  });
+    body: new URLSearchParams({
+      text,
+      source_lang: from.toUpperCase(),
+      target_lang: to.toUpperCase()
+    })
+  })
 
-  if (!resp.ok) {
-    const errTxt = await resp.text().catch(() => "");
-    throw new Error(`STT failed (${resp.status}): ${errTxt.slice(0, 300)}`);
-  }
-
-  const data = await resp.json();
-  const text = data?.text?.trim?.() || "";
-  return text;
+  const json = await res.json()
+  return json.translations?.[0]?.text
 }
 
-async function openaiTranslateText(text, fromLang = "fr", toLang = "en") {
-  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
-  if (!text) return "";
+// ================= WS HANDLER =================
 
-  const from = normalizeLang(fromLang);
-  const to = normalizeLang(toLang);
+wss.on('connection', (ws) => {
 
-  const system = `You are a real-time interpreter. Translate from ${from} to ${to}.
-Rules:
-- Keep meaning, tone, and brevity.
-- No extra commentary.
-- Return only the translated text.`;
+  console.log('🔌 Client WebSocket connecté')
 
-  const body = {
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: text },
-    ],
-    temperature: 0.2,
-  };
-
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    const errTxt = await resp.text().catch(() => "");
-    throw new Error(`Translate failed (${resp.status}): ${errTxt.slice(0, 300)}`);
+  let session = {
+    from: 'fr',
+    to: 'en'
   }
 
-  const data = await resp.json();
-  const out = data?.choices?.[0]?.message?.content?.trim?.() || "";
-  return out;
-}
+  ws.on('message', async (msg) => {
 
-async function openaiTTSBase64Mp3(text) {
-  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
-  if (!text) return "";
+    try {
+      const data = JSON.parse(msg.toString())
 
-  // Modèle TTS stable
-  const body = {
-    model: "tts-1",
-    voice: "alloy",
-    input: text,
-    format: "mp3",
-  };
+      // ================= START =================
 
-  const resp = await fetch("https://api.openai.com/v1/audio/speech", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+      if (data.type === 'start') {
+        session.from = data.from || 'fr'
+        session.to = data.to || 'en'
 
-  if (!resp.ok) {
-    const errTxt = await resp.text().catch(() => "");
-    throw new Error(`TTS failed (${resp.status}): ${errTxt.slice(0, 300)}`);
-  }
+        console.log('▶ SESSION', session.from, '→', session.to)
 
-  const arrayBuffer = await resp.arrayBuffer();
-  const b64 = Buffer.from(arrayBuffer).toString("base64");
-  return b64;
-}
-
-// -------------------- OPTIONAL HTTP TTS (Frontend callTTS) --------------------
-// Ton frontend a une fonction callTTS() qui POST /tts
-app.post("/tts", async (req, res) => {
-  try {
-    const { text } = req.body || {};
-    if (!text || typeof text !== "string") {
-      return res.status(400).json({ error: "Missing text" });
-    }
-    const audioBase64 = await openaiTTSBase64Mp3(text);
-    return res.json({ audioBase64 });
-  } catch (e) {
-    console.error("❌ /tts error:", e?.message || e);
-    return res.status(500).json({ error: e?.message || "TTS error" });
-  }
-});
-
-// -------------------- WEBSOCKET /ws --------------------
-const wss = new WebSocketServer({ server, path: "/ws" });
-console.log("✅ WebSocket path registered: /ws");
-
-wss.on("connection", (ws, req) => {
-  console.log("🔌 WS client connected:", req.socket.remoteAddress);
-
-  // config session par client
-  ws._cfg = {
-    from: "fr",
-    to: "en",
-  };
-
-  // ready immédiat
-  ws.send(JSON.stringify({ type: "ready" }));
-
-  ws.on("message", async (raw) => {
-    const msgStr = raw?.toString?.() || "";
-    const data = safeJsonParse(msgStr);
-
-    if (!data || typeof data !== "object" || !data.type) {
-      ws.send(JSON.stringify({ type: "error", message: "Invalid packet" }));
-      return;
-    }
-
-    // START
-    if (data.type === "start") {
-      ws._cfg.from = normalizeLang(data.from || "fr");
-      ws._cfg.to = normalizeLang(data.to || "en");
-
-      console.log("▶ WS start:", ws._cfg.from, "->", ws._cfg.to);
-
-      ws.send(JSON.stringify({ type: "ready" }));
-      return;
-    }
-
-    // STOP
-    if (data.type === "stop") {
-      console.log("⏹ WS stop");
-      return;
-    }
-
-    // AUDIO
-    if (data.type === "audio") {
-      if (!data.data || typeof data.data !== "string") {
-        ws.send(JSON.stringify({ type: "error", message: "Missing audio data" }));
-        return;
+        ws.send(JSON.stringify({ type: 'ready' }))
+        return
       }
 
-      const t0 = Date.now();
+      // ================= AUDIO =================
 
-      try {
-        const audioBuffer = b64ToBuffer(data.data);
+      if (data.type === 'audio') {
 
-        // 1) STT
-        const sttText = await openaiTranscribeWebm(audioBuffer, ws._cfg.from);
-        ws.send(JSON.stringify({ type: "stt", text: sttText, final: true }));
+        // Decode base64 audio
+        const audioBuffer = Buffer.from(data.data, 'base64')
+        const tempFile = `/tmp/${Date.now()}.webm`
 
-        if (!sttText) {
-          ws.send(JSON.stringify({ type: "error", message: "Empty transcription" }));
-          return;
-        }
+        fs.writeFileSync(tempFile, audioBuffer)
 
-        // 2) Translate
-        const translated = await openaiTranslateText(sttText, ws._cfg.from, ws._cfg.to);
-        ws.send(
-          JSON.stringify({
-            type: "translation",
-            text: translated,
-            sourceLang: ws._cfg.from,
-            targetLang: ws._cfg.to,
-            latencyMs: Date.now() - t0,
-          })
-        );
+        // ---------- STT (Whisper) ----------
 
-        // 3) TTS
-        const ttsBase64 = await openaiTTSBase64Mp3(translated);
-        ws.send(JSON.stringify({ type: "tts", data: ttsBase64 }));
+        const transcript = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(tempFile),
+          model: 'whisper-1',
+          language: session.from
+        })
 
-      } catch (e) {
-        console.error("❌ Pipeline error:", e?.message || e);
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            message: e?.message || "Pipeline error",
-          })
-        );
+        fs.unlinkSync(tempFile)
+
+        if (!transcript.text) return
+
+        // Send STT
+        ws.send(JSON.stringify({
+          type: 'stt',
+          text: transcript.text,
+          final: true
+        }))
+
+        // ---------- TRANSLATION ----------
+
+        const translated = await translateDeepL(
+          transcript.text,
+          session.from,
+          session.to
+        )
+
+        ws.send(JSON.stringify({
+          type: 'translation',
+          text: translated
+        }))
+
+        // ---------- TTS ----------
+
+        const tts = await openai.audio.speech.create({
+          model: 'tts-1',
+          voice: 'alloy',
+          input: translated
+        })
+
+        const audioOut = Buffer.from(await tts.arrayBuffer()).toString('base64')
+
+        ws.send(JSON.stringify({
+          type: 'tts',
+          data: audioOut
+        }))
+
+        return
       }
 
-      return;
+      // ================= STOP =================
+
+      if (data.type === 'stop') {
+        console.log('⏹ Session stopped')
+        return
+      }
+
+    } catch (err) {
+
+      console.error('❌ WS error:', err)
+
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: err.message
+      }))
     }
 
-    // Unknown type
-    ws.send(JSON.stringify({ type: "error", message: `Unknown type: ${data.type}` }));
-  });
+  })
 
-  ws.on("close", () => console.log("👋 WS client disconnected"));
-  ws.on("error", (e) => console.error("❌ WS error:", e?.message || e));
-});
+  ws.on('close', () => {
+    console.log('❎ Client déconnecté')
+  })
+})
 
-// -------------------- START --------------------
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+// ================= START SERVER =================
+
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`)
+})
