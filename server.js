@@ -21,7 +21,22 @@ app.get('/health', (req, res) => {
     status: 'ok',
     wsPath: '/ws',
     timestamp: Date.now()
-  })
+
+})
+app.post('/tts', async (req, res) => {
+  try {
+    const { text, lang } = req.body || {};
+    if (!text) return res.status(400).json({ error: "Missing text" });
+
+    // TODO: ici branche ton vrai TTS (OpenAI ou Google)
+    // Pour le moment renvoyer vide pour éviter crash :
+    return res.json({ audioBase64: "" });
+
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 })
 
 // ================= WEBSOCKET =================
