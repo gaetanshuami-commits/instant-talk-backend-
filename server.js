@@ -1,153 +1,158 @@
-import express from "express";
-import http from "http";
-import cors from "cors";
-import { WebSocketServer } from "ws";
-import dotenv from "dotenv";
-import OpenAI from "openai";
+import express from 'express'
+import http from 'http'
+import cors from 'cors'
+import { WebSocketServer } from 'ws'
+import dotenv from 'dotenv'
+import fetch from 'node-fetch'
+import OpenAI from 'openai'
 
-dotenv.config();
+dotenv.config()
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+// ================= INIT =================
 
-const server = http.createServer(app);
-const PORT = process.env.PORT || 8080;
+const app = express()
+app.use(cors())
+app.use(express.json())
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const server = http.createServer(app)
 
+const PORT = process.env.PORT || 8080
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// ================= HEALTH =================
+// ================= HEALTH CHECK =================
 
-app.get("/health", (req, res) => {
+app.get('/health', (req, res) => {
   res.json({
-    status: "ok",
-    wsPath: "/ws",
+    status: 'ok',
+    wsPath: '/ws',
     timestamp: Date.now()
-  });
-});
-
+  })
+})
 
 // ================= WEBSOCKET =================
 
 const wss = new WebSocketServer({
   server,
-  path: "/ws"
-});
+  path: '/ws'
+})
 
-console.log("✅ WebSocket registered on /ws");
+console.log('✅ WebSocket ready on /ws')
 
-wss.on("connection", (ws) => {
+wss.on('connection', (ws) => {
 
-  console.log("🔌 Client connecté");
+  console.log('🔌 Client connected')
 
   let sessionConfig = {
-    from: "fr",
-    to: "en"
-  };
+    from: 'fr',
+    to: 'en'
+  }
 
-  ws.on("message", async (msg) => {
-
+  ws.on('message', async (msg) => {
     try {
 
-      const data = JSON.parse(msg.toString());
+      const data = JSON.parse(msg.toString())
+      if (!data.type) return
 
-      if (!data.type) return;
+      // ================= START =================
 
-      // START SESSION
-      if (data.type === "start") {
+      if (data.type === 'start') {
 
-        sessionConfig.from = data.from;
-        sessionConfig.to = data.to;
+        sessionConfig.from = data.from || 'fr'
+        sessionConfig.to = data.to || 'en'
 
-        console.log("▶ SESSION", sessionConfig);
+        console.log(`▶ SESSION START ${sessionConfig.from} → ${sessionConfig.to}`)
 
-        ws.send(JSON.stringify({ type: "ready" }));
-        return;
+        ws.send(JSON.stringify({
+          type: 'ready'
+        }))
+
+        return
       }
 
-      // AUDIO CHUNK
-      if (data.type === "audio") {
+      // ================= AUDIO =================
 
-        // === POUR L’INSTANT SIMULATION TEXTE ===
-        // (Remplacé plus tard par Whisper réel streaming)
+      if (data.type === 'audio') {
 
-        const fakeText = "Bonjour ceci est un test";
+        if (!data.data) return
 
-        // SEND STT
-        ws.send(JSON.stringify({
-          type: "stt",
-          text: fakeText,
-          final: true
-        }));
+        // ---- TEMP: PIPELINE SIMULATION ----
+        // (STT Whisper streaming temps réel = étape suivante)
+        const fakeText = 'Audio reçu'
 
-        // TRANSLATION VIA GPT
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          messages: [
-            {
-              role: "system",
-              content: `Translate from ${sessionConfig.from} to ${sessionConfig.to}`
+        // ---- TRANSLATION DeepL ----
+        const deeplResponse = await fetch(
+          'https://api-free.deepl.com/v2/translate',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded'
             },
-            {
-              role: "user",
-              content: fakeText
-            }
-          ]
-        });
+            body: new URLSearchParams({
+              auth_key: process.env.DEEPL_API_KEY,
+              text: fakeText,
+              target_lang: sessionConfig.to.toUpperCase()
+            })
+          }
+        )
 
-        const translatedText = completion.choices[0].message.content;
+        const deeplJson = await deeplResponse.json()
 
+        const translatedText =
+          deeplJson?.translations?.[0]?.text || fakeText
+
+        // SEND TRANSLATION TEXT
         ws.send(JSON.stringify({
-          type: "translation",
-          text: translatedText
-        }));
+          type: 'translation',
+          text: translatedText,
+          sourceLang: sessionConfig.from,
+          targetLang: sessionConfig.to
+        }))
 
-        // TTS AUDIO
-        const tts = await openai.audio.speech.create({
-          model: "gpt-4o-mini-tts",
-          voice: "alloy",
+        // ---- TTS OPENAI ----
+
+        const speech = await openai.audio.speech.create({
+          model: 'tts-1',
+          voice: 'alloy',
           input: translatedText
-        });
+        })
 
-        const buffer = Buffer.from(await tts.arrayBuffer());
-        const audioBase64 = buffer.toString("base64");
+        const buffer = Buffer.from(await speech.arrayBuffer())
+        const base64Audio = buffer.toString('base64')
 
         ws.send(JSON.stringify({
-          type: "tts",
-          data: audioBase64
-        }));
+          type: 'tts',
+          data: base64Audio
+        }))
 
-        return;
+        return
       }
 
-      if (data.type === "stop") {
-        console.log("⏹ Session stop");
+      // ================= STOP =================
+
+      if (data.type === 'stop') {
+        console.log('⏹ SESSION STOPPED')
+        return
       }
 
     } catch (err) {
 
-      console.error("❌ WS ERROR", err);
+      console.error('❌ WS ERROR', err)
 
       ws.send(JSON.stringify({
-        type: "error",
+        type: 'error',
         message: err.message
-      }));
+      }))
     }
+  })
 
-  });
+  ws.on('close', () => {
+    console.log('❎ Client disconnected')
+  })
 
-  ws.on("close", () => {
-    console.log("❎ Client disconnect");
-  });
+})
 
-});
-
-
-// ================= START =================
+// ================= START SERVER =================
 
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on ${PORT}`);
-});
+  console.log(`🚀 Backend running on port ${PORT}`)
+})
