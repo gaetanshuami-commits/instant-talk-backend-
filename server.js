@@ -3,165 +3,235 @@ import http from "http";
 import cors from "cors";
 import { WebSocketServer } from "ws";
 import dotenv from "dotenv";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import OpenAI from "openai";
+import * as deepl from "deepl-node";
 
 dotenv.config();
 
 const app = express();
-
-// CORS large (ok pour MVP). Plus tard tu peux restreindre au domaine Base44.
-app.use(cors({ origin: "*", methods: ["GET", "POST"], allowedHeaders: ["Content-Type", "Authorization"] }));
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const server = http.createServer(app);
-const PORT = Number(process.env.PORT || 8080);
+const PORT = process.env.PORT || 8080;
 
-// ===================== OPENAI =====================
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const DEEPL_API_KEY = process.env.DEEPL_API_KEY || "";
 
-// ===================== HEALTH CHECK =====================
+if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY manquante");
+if (!DEEPL_API_KEY) console.warn("⚠️ DEEPL_API_KEY manquante");
+
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const translator = DEEPL_API_KEY ? new deepl.Translator(DEEPL_API_KEY) : null;
+
+// --------- Helpers ----------
+function safeJsonSend(ws, obj) {
+  try {
+    ws.send(JSON.stringify(obj));
+  } catch (e) {
+    console.error("❌ WS send error:", e?.message);
+  }
+}
+
+function normalizeLang(code) {
+  if (!code) return "en";
+  return String(code).toLowerCase().split("-")[0];
+}
+
+function tmpFile(ext) {
+  const name = `chunk_${Date.now()}_${Math.random().toString(16).slice(2)}.${ext}`;
+  return path.join(os.tmpdir(), name);
+}
+
+// ================= HEALTH CHECK =================
 app.get("/health", (req, res) => {
-  res.status(200).json({
+  res.json({
     status: "ok",
     wsPath: "/ws",
-    ttsPath: "/tts",
     timestamp: Date.now(),
   });
 });
 
-// ===================== TTS ENDPOINT =====================
-// Body: { text: string, lang?: string, voice?: string }
+// ================= TTS HTTP (optionnel mais utile) =================
 app.post("/tts", async (req, res) => {
   try {
-    const { text, voice } = req.body || {};
-
-    if (!text || typeof text !== "string" || text.trim().length === 0) {
-      return res.status(400).json({ error: "Missing 'text' (string)" });
+    const { text, lang, voice } = req.body || {};
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({ error: "Missing text" });
+    }
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OPENAI_API_KEY missing" });
     }
 
-    if (!openai) {
-      return res.status(500).json({ error: "OPENAI_API_KEY not configured on Railway" });
-    }
-
-    // voix OpenAI possibles: alloy, verse, aria, etc (selon compte).
-    const selectedVoice = (voice && typeof voice === "string") ? voice : "alloy";
+    const voiceName = (voice && typeof voice === "string") ? voice : "alloy";
 
     const tts = await openai.audio.speech.create({
       model: "tts-1",
-      voice: selectedVoice,
+      voice: voiceName,
       input: text,
-      format: "mp3",
     });
 
     const audioBuffer = Buffer.from(await tts.arrayBuffer());
     const audioBase64 = audioBuffer.toString("base64");
 
-    return res.status(200).json({ audioBase64 });
+    res.json({ audioBase64, lang: lang || "auto", voice: voiceName });
   } catch (err) {
     console.error("❌ /tts error:", err);
-    return res.status(500).json({ error: err?.message || "TTS failure" });
+    res.status(500).json({ error: err?.message || "TTS failed" });
   }
 });
 
-// ===================== WEBSOCKET /ws =====================
-// Messages attendus:
-// start: {type:'start', from:'fr', to:'en', audioFormat:'webm/opus', sampleRate:48000, voiceMode?:boolean}
-// audio: {type:'audio', data:'<base64 webm>'}
-// stop: {type:'stop'}
-const wss = new WebSocketServer({ server, path: "/ws" });
+// ================= WEBSOCKET =================
+const wss = new WebSocketServer({
+  server,
+  path: "/ws",
+});
+
 console.log("✅ WebSocket path registered: /ws");
 
 wss.on("connection", (ws) => {
   console.log("🔌 Client WebSocket connecté");
 
-  // session config par client
-  let session = {
+  // config par connexion
+  let cfg = {
     from: "fr",
     to: "en",
+    audioFormat: "audio/webm;codecs=opus",
+    sampleRate: 48000,
     voiceMode: false,
   };
 
-  ws.on("message", async (msg) => {
+  ws.on("message", async (raw) => {
+    const t0 = Date.now();
     try {
-      const raw = msg?.toString?.() ?? "";
-      if (!raw) return;
+      const msg = JSON.parse(raw.toString());
+      if (!msg?.type) return;
 
-      let data;
-      try {
-        data = JSON.parse(raw);
-      } catch {
-        ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
+      // START
+      if (msg.type === "start") {
+        cfg = {
+          ...cfg,
+          from: normalizeLang(msg.from || cfg.from),
+          to: normalizeLang(msg.to || cfg.to),
+          audioFormat: msg.audioFormat || cfg.audioFormat,
+          sampleRate: msg.sampleRate || cfg.sampleRate,
+          voiceMode: !!msg.voiceMode,
+        };
+
+        console.log("▶ start:", cfg.from, "->", cfg.to, "|", cfg.audioFormat);
+
+        safeJsonSend(ws, { type: "ready" });
         return;
       }
 
-      if (!data?.type) return;
-
-      if (data.type === "start") {
-        session.from = typeof data.from === "string" ? data.from : "fr";
-        session.to = typeof data.to === "string" ? data.to : "en";
-        session.voiceMode = !!data.voiceMode;
-
-        console.log("▶ Session started", session.from, "->", session.to, "voiceMode:", session.voiceMode);
-
-        ws.send(JSON.stringify({ type: "ready" }));
+      // STOP
+      if (msg.type === "stop") {
+        console.log("⏹ stop");
         return;
       }
 
-      if (data.type === "stop") {
-        console.log("⏹ Session stopped");
-        return;
-      }
-
-      if (data.type === "audio") {
-        // Pour l’instant: on confirme pipeline (comme ton test)
-        // Étape suivante: STT -> Translation -> (optionnel) TTS
-
-        if (!data.data || typeof data.data !== "string") {
-          ws.send(JSON.stringify({ type: "error", message: "Missing audio data (base64)" }));
+      // AUDIO CHUNK
+      if (msg.type === "audio") {
+        if (!msg.data || typeof msg.data !== "string") {
+          safeJsonSend(ws, { type: "error", message: "Missing audio data" });
+          return;
+        }
+        if (!OPENAI_API_KEY) {
+          safeJsonSend(ws, { type: "error", message: "OPENAI_API_KEY missing" });
           return;
         }
 
-        // ✅ 1) STT (à brancher ensuite)
-        // Ici tu peux brancher Whisper / Google STT.
-        // Pour ne pas casser, on envoie un stt simulé:
-        ws.send(JSON.stringify({ type: "stt", text: "[OK] audio chunk reçu", final: true }));
+        // 1) sauver chunk base64 -> .webm
+        const file = tmpFile("webm");
+        fs.writeFileSync(file, Buffer.from(msg.data, "base64"));
 
-        // ✅ 2) Translation (simulée, à remplacer)
-        ws.send(JSON.stringify({
+        // 2) STT Whisper
+        let transcriptText = "";
+        try {
+          const stt = await openai.audio.transcriptions.create({
+            file: fs.createReadStream(file),
+            model: "whisper-1",
+            language: cfg.from, // si tu veux auto-detect, enlève cette ligne
+          });
+          transcriptText = stt?.text || "";
+        } catch (e) {
+          console.error("❌ STT error:", e?.message);
+          safeJsonSend(ws, { type: "error", message: "STT failed", details: e?.message });
+          return;
+        } finally {
+          try { fs.unlinkSync(file); } catch {}
+        }
+
+        if (!transcriptText) {
+          safeJsonSend(ws, { type: "error", message: "Empty transcription" });
+          return;
+        }
+
+        safeJsonSend(ws, { type: "stt", text: transcriptText, final: true });
+
+        // 3) Translate DeepL (si clé dispo), sinon fallback = texte original
+        let translatedText = transcriptText;
+        if (translator) {
+          try {
+            const result = await translator.translateText(
+              transcriptText,
+              cfg.from.toUpperCase(),
+              cfg.to.toUpperCase()
+            );
+            translatedText = result?.text || transcriptText;
+          } catch (e) {
+            console.error("❌ DeepL error:", e?.message);
+            // fallback
+            translatedText = transcriptText;
+          }
+        }
+
+        safeJsonSend(ws, {
           type: "translation",
-          text: "[OK] Audio reçu",
-          sourceLang: session.from,
-          targetLang: session.to
-        }));
+          text: translatedText,
+          sourceLang: cfg.from,
+          targetLang: cfg.to,
+          latencyMs: Date.now() - t0,
+        });
 
-        // ✅ 3) TTS (si voiceMode actif) via OpenAI
-        if (session.voiceMode && openai) {
+        // 4) TTS (renvoie base64 mp3)
+        try {
           const tts = await openai.audio.speech.create({
             model: "tts-1",
             voice: "alloy",
-            input: "[OK] Audio reçu",
-            format: "mp3",
+            input: translatedText,
           });
+
           const audioBuffer = Buffer.from(await tts.arrayBuffer());
           const audioBase64 = audioBuffer.toString("base64");
 
-          ws.send(JSON.stringify({ type: "tts", data: audioBase64 }));
+          safeJsonSend(ws, { type: "tts", data: audioBase64 });
+        } catch (e) {
+          console.error("❌ TTS error:", e?.message);
+          safeJsonSend(ws, { type: "error", message: "TTS failed", details: e?.message });
         }
 
         return;
       }
     } catch (err) {
-      console.error("❌ WS error", err);
-      try {
-        ws.send(JSON.stringify({ type: "error", message: err?.message || "WS error" }));
-      } catch {}
+      console.error("❌ WS message error:", err);
+      safeJsonSend(ws, { type: "error", message: err?.message || "Invalid packet" });
     }
   });
 
-  ws.on("close", () => console.log("❎ Client déconnecté"));
+  ws.on("close", () => {
+    console.log("❎ Client déconnecté");
+  });
+
+  ws.on("error", (e) => {
+    console.error("❌ WS socket error:", e?.message);
+  });
 });
 
+// ================= SERVER START =================
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
