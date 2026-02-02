@@ -1,186 +1,153 @@
-import express from 'express'
-import http from 'http'
-import cors from 'cors'
-import { WebSocketServer } from 'ws'
-import dotenv from 'dotenv'
-import OpenAI from 'openai'
-import fetch from 'node-fetch'
-import fs from 'fs'
-import path from 'path'
+import express from "express";
+import http from "http";
+import cors from "cors";
+import { WebSocketServer } from "ws";
+import dotenv from "dotenv";
+import OpenAI from "openai";
 
-dotenv.config()
+dotenv.config();
 
-// ================= CONFIG =================
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-const PORT = process.env.PORT || 8080
-const OPENAI_KEY = process.env.OPENAI_API_KEY
-const DEEPL_KEY = process.env.DEEPL_API_KEY
+const server = http.createServer(app);
+const PORT = process.env.PORT || 8080;
 
-if (!OPENAI_KEY) throw new Error('OPENAI_API_KEY missing')
-if (!DEEPL_KEY) throw new Error('DEEPL_API_KEY missing')
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
-// ================= INIT =================
-
-const app = express()
-app.use(cors())
-app.use(express.json())
-
-const server = http.createServer(app)
-const openai = new OpenAI({ apiKey: OPENAI_KEY })
 
 // ================= HEALTH =================
 
-app.get('/health', (req, res) => {
+app.get("/health", (req, res) => {
   res.json({
-    status: 'ok',
-    wsPath: '/ws',
+    status: "ok",
+    wsPath: "/ws",
     timestamp: Date.now()
-  })
-})
+  });
+});
+
 
 // ================= WEBSOCKET =================
 
 const wss = new WebSocketServer({
   server,
-  path: '/ws'
-})
+  path: "/ws"
+});
 
-console.log('✅ WebSocket path registered: /ws')
+console.log("✅ WebSocket registered on /ws");
 
-// ================= HELPERS =================
+wss.on("connection", (ws) => {
 
-async function translateDeepL(text, from, to) {
-  const res = await fetch('https://api-free.deepl.com/v2/translate', {
-    method: 'POST',
-    headers: {
-      'Authorization': `DeepL-Auth-Key ${DEEPL_KEY}`,
-      'Content-Type': 'application/x-www-form-urlencoded'
-    },
-    body: new URLSearchParams({
-      text,
-      source_lang: from.toUpperCase(),
-      target_lang: to.toUpperCase()
-    })
-  })
+  console.log("🔌 Client connecté");
 
-  const json = await res.json()
-  return json.translations?.[0]?.text
-}
+  let sessionConfig = {
+    from: "fr",
+    to: "en"
+  };
 
-// ================= WS HANDLER =================
-
-wss.on('connection', (ws) => {
-
-  console.log('🔌 Client WebSocket connecté')
-
-  let session = {
-    from: 'fr',
-    to: 'en'
-  }
-
-  ws.on('message', async (msg) => {
+  ws.on("message", async (msg) => {
 
     try {
-      const data = JSON.parse(msg.toString())
 
-      // ================= START =================
+      const data = JSON.parse(msg.toString());
 
-      if (data.type === 'start') {
-        session.from = data.from || 'fr'
-        session.to = data.to || 'en'
+      if (!data.type) return;
 
-        console.log('▶ SESSION', session.from, '→', session.to)
+      // START SESSION
+      if (data.type === "start") {
 
-        ws.send(JSON.stringify({ type: 'ready' }))
-        return
+        sessionConfig.from = data.from;
+        sessionConfig.to = data.to;
+
+        console.log("▶ SESSION", sessionConfig);
+
+        ws.send(JSON.stringify({ type: "ready" }));
+        return;
       }
 
-      // ================= AUDIO =================
+      // AUDIO CHUNK
+      if (data.type === "audio") {
 
-      if (data.type === 'audio') {
+        // === POUR L’INSTANT SIMULATION TEXTE ===
+        // (Remplacé plus tard par Whisper réel streaming)
 
-        // Decode base64 audio
-        const audioBuffer = Buffer.from(data.data, 'base64')
-        const tempFile = `/tmp/${Date.now()}.webm`
+        const fakeText = "Bonjour ceci est un test";
 
-        fs.writeFileSync(tempFile, audioBuffer)
-
-        // ---------- STT (Whisper) ----------
-
-        const transcript = await openai.audio.transcriptions.create({
-          file: fs.createReadStream(tempFile),
-          model: 'whisper-1',
-          language: session.from
-        })
-
-        fs.unlinkSync(tempFile)
-
-        if (!transcript.text) return
-
-        // Send STT
+        // SEND STT
         ws.send(JSON.stringify({
-          type: 'stt',
-          text: transcript.text,
+          type: "stt",
+          text: fakeText,
           final: true
-        }))
+        }));
 
-        // ---------- TRANSLATION ----------
+        // TRANSLATION VIA GPT
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content: `Translate from ${sessionConfig.from} to ${sessionConfig.to}`
+            },
+            {
+              role: "user",
+              content: fakeText
+            }
+          ]
+        });
 
-        const translated = await translateDeepL(
-          transcript.text,
-          session.from,
-          session.to
-        )
+        const translatedText = completion.choices[0].message.content;
 
         ws.send(JSON.stringify({
-          type: 'translation',
-          text: translated
-        }))
+          type: "translation",
+          text: translatedText
+        }));
 
-        // ---------- TTS ----------
-
+        // TTS AUDIO
         const tts = await openai.audio.speech.create({
-          model: 'tts-1',
-          voice: 'alloy',
-          input: translated
-        })
+          model: "gpt-4o-mini-tts",
+          voice: "alloy",
+          input: translatedText
+        });
 
-        const audioOut = Buffer.from(await tts.arrayBuffer()).toString('base64')
+        const buffer = Buffer.from(await tts.arrayBuffer());
+        const audioBase64 = buffer.toString("base64");
 
         ws.send(JSON.stringify({
-          type: 'tts',
-          data: audioOut
-        }))
+          type: "tts",
+          data: audioBase64
+        }));
 
-        return
+        return;
       }
 
-      // ================= STOP =================
-
-      if (data.type === 'stop') {
-        console.log('⏹ Session stopped')
-        return
+      if (data.type === "stop") {
+        console.log("⏹ Session stop");
       }
 
     } catch (err) {
 
-      console.error('❌ WS error:', err)
+      console.error("❌ WS ERROR", err);
 
       ws.send(JSON.stringify({
-        type: 'error',
+        type: "error",
         message: err.message
-      }))
+      }));
     }
 
-  })
+  });
 
-  ws.on('close', () => {
-    console.log('❎ Client déconnecté')
-  })
-})
+  ws.on("close", () => {
+    console.log("❎ Client disconnect");
+  });
 
-// ================= START SERVER =================
+});
+
+
+// ================= START =================
 
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`)
-})
+  console.log(`🚀 Server running on ${PORT}`);
+});
