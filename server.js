@@ -9,18 +9,6 @@ import * as deepl from 'deepl-node'
 
 dotenv.config()
 
-// ================= ENV CHECK =================
-
-if (!process.env.OPENAI_API_KEY) {
-  console.error("❌ OPENAI_API_KEY missing")
-  process.exit(1)
-}
-
-if (!process.env.DEEPL_API_KEY) {
-  console.error("❌ DEEPL_API_KEY missing")
-  process.exit(1)
-}
-
 // ================= INIT =================
 
 const app = express()
@@ -28,6 +16,7 @@ app.use(cors())
 app.use(express.json())
 
 const server = http.createServer(app)
+
 const PORT = process.env.PORT || 8080
 
 const openai = new OpenAI({
@@ -40,8 +29,8 @@ const translator = new deepl.Translator(process.env.DEEPL_API_KEY)
 
 app.get('/health', (req, res) => {
   res.json({
-    status: "ok",
-    wsPath: "/ws",
+    status: 'ok',
+    wsPath: '/ws',
     timestamp: Date.now()
   })
 })
@@ -50,99 +39,110 @@ app.get('/health', (req, res) => {
 
 const wss = new WebSocketServer({
   server,
-  path: "/ws"
+  path: '/ws'
 })
 
-console.log("✅ WebSocket ready on /ws")
+console.log('✅ WebSocket ready on /ws')
 
-wss.on("connection", (ws) => {
+wss.on('connection', (ws) => {
 
-  console.log("🔌 Client connected")
+  console.log('🔌 Client connected')
 
-  let session = {
-    from: "fr",
-    to: "en"
+  let sessionConfig = {
+    from: 'fr',
+    to: 'en'
   }
 
-  ws.on("message", async (msg) => {
+  ws.on('message', async (raw) => {
 
     try {
 
-      const data = JSON.parse(msg.toString())
+      const data = JSON.parse(raw.toString())
+
+      if (!data?.type) return
 
       // ---------- START ----------
 
-      if (data.type === "start") {
+      if (data.type === 'start') {
 
-        session.from = data.from || "fr"
-        session.to = data.to || "en"
+        sessionConfig.from = data.from || 'fr'
+        sessionConfig.to = data.to || 'en'
 
-        console.log(`▶ SESSION ${}
+        console.log('▶ Session start', sessionConfig)
 
-${session.from} -> ${session.to}`)
-
-        ws.send(JSON.stringify({
-          type: "ready"
-        }))
+        ws.send(JSON.stringify({ type: 'ready' }))
 
         return
       }
 
       // ---------- AUDIO ----------
 
-      if (data.type === "audio") {
+      if (data.type === 'audio') {
 
         if (!data.data) return
 
-        const audioBuffer = Buffer.from(data.data, "base64")
+        const audioBuffer = Buffer.from(data.data, 'base64')
 
         const tempFile = `/tmp/audio-${Date.now()}.webm`
+
         fs.writeFileSync(tempFile, audioBuffer)
 
         // ===== STT Whisper =====
 
         const transcription = await openai.audio.transcriptions.create({
           file: fs.createReadStream(tempFile),
-          model: "whisper-1",
-          language: session.from
+          model: 'whisper-1',
+          language: sessionConfig.from
         })
 
         fs.unlinkSync(tempFile)
 
-        if (!transcription.text) return
+        if (!transcription?.text) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: 'STT failed'
+          }))
+          return
+        }
+
+        const originalText = transcription.text
 
         ws.send(JSON.stringify({
-          type: "stt",
-          text: transcription.text
+          type: 'stt',
+          text: originalText,
+          final: true
         }))
 
-        // ===== TRANSLATION =====
+        // ===== DeepL =====
 
-        const result = await translator.translateText(
-          transcription.text,
-          session.from.toUpperCase(),
-          session.to.toUpperCase()
+        const translated = await translator.translateText(
+          originalText,
+          sessionConfig.from.toUpperCase(),
+          sessionConfig.to.toUpperCase()
         )
 
+        const translatedText = translated.text
+
         ws.send(JSON.stringify({
-          type: "translation",
-          text: result.text
+          type: 'translation',
+          text: translatedText,
+          sourceLang: sessionConfig.from,
+          targetLang: sessionConfig.to
         }))
 
-        // ===== TTS =====
+        // ===== TTS OpenAI =====
 
-        const speech = await openai.audio.speech.create({
-          model: "tts-1",
-          voice: "alloy",
-          input: result.text
+        const tts = await openai.audio.speech.create({
+          model: 'tts-1',
+          voice: 'alloy',
+          input: translatedText
         })
 
-        const ttsBuffer = Buffer.from(await speech.arrayBuffer())
-        const ttsBase64 = ttsBuffer.toString("base64")
+        const ttsBuffer = Buffer.from(await tts.arrayBuffer())
 
         ws.send(JSON.stringify({
-          type: "tts",
-          data: ttsBase64
+          type: 'tts',
+          data: ttsBuffer.toString('base64')
         }))
 
         return
@@ -150,30 +150,30 @@ ${session.from} -> ${session.to}`)
 
       // ---------- STOP ----------
 
-      if (data.type === "stop") {
-        console.log("⏹ Session stopped")
+      if (data.type === 'stop') {
+        console.log('⏹ Session stop')
       }
 
     } catch (err) {
 
-      console.error("❌ Pipeline error:", err)
+      console.error('❌ Pipeline error', err)
 
       ws.send(JSON.stringify({
-        type: "error",
+        type: 'error',
         message: err.message
       }))
     }
 
   })
 
-  ws.on("close", () => {
-    console.log("👋 Client disconnected")
+  ws.on('close', () => {
+    console.log('👋 Client disconnected')
   })
 
 })
 
-// ================= START SERVER =================
+// ================= SERVER =================
 
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`)
+  console.log(`🚀 Server running on ${PORT}`)
 })
