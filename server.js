@@ -28,35 +28,57 @@ const translator = new deepl.Translator(DEEPL_API_KEY)
 const wss = new WebSocketServer({ server, path: '/ws' })
 console.log('✅ WebSocket server ready on /ws')
 
-// ---------- WAV helper (PCM Int16 LE, mono) ----------
+// ---------- Helpers ----------
+function safeSend(ws, obj) {
+  try {
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj))
+  } catch {}
+}
+
+// DeepL mapping: enforce EN-US / EN-GB
+function mapDeeplTargetLang(lang) {
+  const l = String(lang || '').trim().toLowerCase()
+  if (l === 'en' || l === 'en-us' || l === 'en-gb') {
+    // Change here if you prefer EN-GB:
+    return 'EN-US'
+  }
+  return l.toUpperCase()
+}
+
+function mapDeeplSourceLang(lang) {
+  const l = String(lang || '').trim().toLowerCase()
+  // DeepL source languages are generally fine like FR, DE, ES, EN...
+  // Keep EN as EN (not EN-US)
+  if (l === 'en-us' || l === 'en-gb') return 'EN'
+  return l.toUpperCase()
+}
+
+// ---------- WAV helper (PCM Int16 LE, mono/stereo) ----------
 function writeWavFileFromPcmInt16LE({ pcmInt16, sampleRate, channels, filePath }) {
-  const bytesPerSample = 2 // int16
+  const bytesPerSample = 2
   const blockAlign = channels * bytesPerSample
   const byteRate = sampleRate * blockAlign
   const dataSize = pcmInt16.length * bytesPerSample
   const headerSize = 44
+
   const buffer = Buffer.alloc(headerSize + dataSize)
 
-  // RIFF header
   buffer.write('RIFF', 0)
   buffer.writeUInt32LE(36 + dataSize, 4)
   buffer.write('WAVE', 8)
 
-  // fmt chunk
   buffer.write('fmt ', 12)
-  buffer.writeUInt32LE(16, 16) // PCM
-  buffer.writeUInt16LE(1, 20) // AudioFormat = 1 (PCM)
+  buffer.writeUInt32LE(16, 16)
+  buffer.writeUInt16LE(1, 20) // PCM
   buffer.writeUInt16LE(channels, 22)
   buffer.writeUInt32LE(sampleRate, 24)
   buffer.writeUInt32LE(byteRate, 28)
   buffer.writeUInt16LE(blockAlign, 32)
-  buffer.writeUInt16LE(16, 34) // bits per sample
+  buffer.writeUInt16LE(16, 34) // bits
 
-  // data chunk
   buffer.write('data', 36)
   buffer.writeUInt32LE(dataSize, 40)
 
-  // PCM samples (Int16 LE)
   for (let i = 0; i < pcmInt16.length; i++) {
     buffer.writeInt16LE(pcmInt16[i], headerSize + i * 2)
   }
@@ -64,35 +86,29 @@ function writeWavFileFromPcmInt16LE({ pcmInt16, sampleRate, channels, filePath }
   fs.writeFileSync(filePath, buffer)
 }
 
-function safeSend(ws, obj) {
-  try {
-    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj))
-  } catch {}
-}
-
 wss.on('connection', (ws) => {
   console.log('🔌 Client connected')
 
-  // Session state
+  // Session config
   let from = 'fr'
   let to = 'en'
   let sampleRate = 16000
   let channels = 1
 
   // Buffer audio
-  let pcmChunks = [] // array of Int16Array
+  let pcmChunks = []
   let totalSamples = 0
   let busy = false
 
   safeSend(ws, { type: 'ready' })
 
   ws.on('message', async (data, isBinary) => {
-    // 1) Control messages (JSON)
+    // 1) Control JSON
     if (!isBinary) {
       let msg
       try {
         msg = JSON.parse(data.toString())
-      } catch (e) {
+      } catch {
         safeSend(ws, { type: 'error', message: 'Invalid JSON control message' })
         return
       }
@@ -107,7 +123,7 @@ wss.on('connection', (ws) => {
         totalSamples = 0
         busy = false
 
-        console.log(`▶ START session ${from} -> ${to} | sr=${sampleRate} ch=${channels}`)
+        console.log(`▶ START ${from} -> ${to} | sr=${sampleRate} ch=${channels}`)
         safeSend(ws, { type: 'ready' })
         return
       }
@@ -120,9 +136,8 @@ wss.on('connection', (ws) => {
           return
         }
 
-        // Nothing to process
+        // Need at least ~200ms
         if (totalSamples < sampleRate * 0.2) {
-          // < 200ms
           safeSend(ws, { type: 'error', message: 'Audio too short. Speak longer then Stop.' })
           pcmChunks = []
           totalSamples = 0
@@ -133,7 +148,7 @@ wss.on('connection', (ws) => {
         safeSend(ws, { type: 'info', message: 'processing' })
 
         try {
-          // Merge Int16 chunks
+          // Merge PCM
           const merged = new Int16Array(totalSamples)
           let offset = 0
           for (const chunk of pcmChunks) {
@@ -169,11 +184,15 @@ wss.on('connection', (ws) => {
           safeSend(ws, { type: 'stt', text: originalText, final: true })
 
           // ===== Translation (DeepL) =====
+          const deeplSource = mapDeeplSourceLang(from)
+          const deeplTarget = mapDeeplTargetLang(to) // ✅ EN-US fix here
+
           const translated = await translator.translateText(
             originalText,
-            from.toUpperCase(),
-            to.toUpperCase()
+            deeplSource,
+            deeplTarget
           )
+
           const translatedText = translated.text
           safeSend(ws, { type: 'translation', text: translatedText, sourceLang: from, targetLang: to })
 
@@ -183,12 +202,14 @@ wss.on('connection', (ws) => {
             voice: 'alloy',
             input: translatedText
           })
+
           const ttsBuffer = Buffer.from(await tts.arrayBuffer())
           safeSend(ws, { type: 'tts', audio: ttsBuffer.toString('base64') })
 
+          // Cleanup
           fs.unlinkSync(wavPath)
 
-          // Reset buffer for next turn
+          // Reset
           pcmChunks = []
           totalSamples = 0
           busy = false
@@ -202,28 +223,25 @@ wss.on('connection', (ws) => {
         return
       }
 
-      // Ignore unknown control types
       return
     }
 
-    // 2) Binary audio (PCM Int16 LE)
+    // 2) Binary PCM Int16
     if (busy) {
       safeSend(ws, { type: 'info', message: 'busy_skip_chunk' })
       return
     }
 
-    // ws gives Buffer; convert to Int16Array safely
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data)
     if (buf.length < 2) return
 
-    // Ensure even length
     const evenLen = buf.length - (buf.length % 2)
     if (evenLen <= 0) return
 
     const slice = buf.subarray(0, evenLen)
     const pcm16 = new Int16Array(slice.buffer, slice.byteOffset, slice.byteLength / 2)
 
-    // Copy chunk (important: underlying buffer reused sometimes)
+    // copy chunk
     const copy = new Int16Array(pcm16.length)
     copy.set(pcm16)
 
