@@ -1,3 +1,6 @@
+const fs = require("fs");
+const WebSocket = require("ws");
+
 // ================= DEBUG AUDIO =================
 
 function pcm16Stats(buf) {
@@ -43,4 +46,100 @@ function wavHeader({ sampleRate, numChannels, bitsPerSample, dataBytes }) {
   buffer.writeUInt32LE(dataBytes, 40);
 
   return buffer;
+}
+
+// ================= SERVER =================
+
+const wss = new WebSocket.Server({ port: 8080 });
+
+wss.on("connection", (ws) => {
+  console.log("Client connected");
+
+  let pcmChunks = [];
+  let debugCounter = 0;
+
+  ws.on("message", async (data) => {
+
+    // ====== BINAIRE PCM ======
+    if (Buffer.isBuffer(data)) {
+      pcmChunks.push(data);
+      return;
+    }
+
+    // ====== MESSAGE JSON ======
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch (e) {
+      return;
+    }
+
+    // ====== FLUSH ======
+    if (msg.type === "flush") {
+
+      console.log("[FLUSH] received", {
+        chunks: pcmChunks.length,
+        bytes: pcmChunks.reduce((s, b) => s + b.length, 0),
+        time: Date.now(),
+      });
+
+      if (pcmChunks.length === 0) return;
+
+      // CONCAT PCM
+      const pcmBuffer = Buffer.concat(pcmChunks);
+      pcmChunks = [];
+
+      // AUDIO STATS
+      const { samples, min, max, rms, peak } = pcm16Stats(pcmBuffer);
+
+      const durationMs = Math.round((samples / 16000) * 1000);
+
+      console.log("[AUDIO IN]", {
+        bytes: pcmBuffer.length,
+        samples,
+        durationMs,
+        min,
+        max,
+        rms: Number(rms.toFixed(5)),
+        peak: Number(peak.toFixed(5)),
+      });
+
+      // WAV BUILD
+      const header = wavHeader({
+        sampleRate: 16000,
+        numChannels: 1,
+        bitsPerSample: 16,
+        dataBytes: pcmBuffer.length,
+      });
+
+      const wavBuffer = Buffer.concat([header, pcmBuffer]);
+
+      console.log("[WHISPER] sending audio", {
+        bytes: wavBuffer.length,
+        durationMs,
+      });
+
+      // DEBUG WAV (1 sur 5)
+      debugCounter++;
+      if (debugCounter % 5 === 0) {
+        const file = `/tmp/instanttalk_debug_${Date.now()}.wav`;
+        fs.writeFileSync(file, wavBuffer);
+        console.log("[DEBUG WAV] saved:", file);
+      }
+
+      // ====== APPEL WHISPER ======
+      await sendToWhisper(wavBuffer);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("Client disconnected");
+  });
+});
+
+// ================= WHISPER CALL =================
+
+async function sendToWhisper(wavBuffer) {
+  // Remplace par ton appel OpenAI existant
+  console.log("Sending to Whisper...");
 }
