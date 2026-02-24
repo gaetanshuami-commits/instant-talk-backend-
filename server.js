@@ -1,11 +1,16 @@
-const fs = require("fs");
-const WebSocket = require("ws");
+// server.js (ESM) — prêt à coller pour Railway
+import http from "http";
+import fs from "fs";
+import WebSocket, { WebSocketServer } from "ws";
+
+const PORT = Number(process.env.PORT || 8080);
 
 // ================= DEBUG AUDIO =================
 
 function pcm16Stats(buf) {
   const samples = Math.floor(buf.length / 2);
-  let min = 32767, max = -32768;
+  let min = 32767,
+    max = -32768;
   let sumSq = 0;
   let peak = 0;
 
@@ -35,7 +40,7 @@ function wavHeader({ sampleRate, numChannels, bitsPerSample, dataBytes }) {
 
   buffer.write("fmt ", 12);
   buffer.writeUInt32LE(16, 16);
-  buffer.writeUInt16LE(1, 20);
+  buffer.writeUInt16LE(1, 20); // PCM
   buffer.writeUInt16LE(numChannels, 22);
   buffer.writeUInt32LE(sampleRate, 24);
   buffer.writeUInt32LE(byteRate, 28);
@@ -48,50 +53,64 @@ function wavHeader({ sampleRate, numChannels, bitsPerSample, dataBytes }) {
   return buffer;
 }
 
-// ================= SERVER =================
+// ================= SERVER HTTP (Railway friendly) =================
 
-const wss = new WebSocket.Server({ port: 8080 });
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("ok");
+    return;
+  }
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end("instant-talk-backend");
+});
+
+// ================= WEBSOCKET =================
+
+const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
-  console.log("Client connected");
+  console.log("[WS] client connected");
 
-  let pcmChunks = [];
+  let pcmChunks = []; // Buffer[]
   let debugCounter = 0;
 
   ws.on("message", async (data) => {
-
-    // ====== BINAIRE PCM ======
+    // 1) PCM binary
     if (Buffer.isBuffer(data)) {
-      pcmChunks.push(data);
+      // alignment guard: ensure even length for Int16
+      if (data.length % 2 !== 0) data = data.slice(0, data.length - 1);
+      if (data.length > 0) pcmChunks.push(data);
       return;
     }
 
-    // ====== MESSAGE JSON ======
+    // 2) JSON messages (flush, etc.)
     let msg;
     try {
       msg = JSON.parse(data.toString());
-    } catch (e) {
+    } catch {
       return;
     }
 
-    // ====== FLUSH ======
-    if (msg.type === "flush") {
+    if (msg?.type === "flush") {
+      const totalBytes = pcmChunks.reduce((s, b) => s + b.length, 0);
 
       console.log("[FLUSH] received", {
         chunks: pcmChunks.length,
-        bytes: pcmChunks.reduce((s, b) => s + b.length, 0),
+        bytes: totalBytes,
         time: Date.now(),
       });
 
-      if (pcmChunks.length === 0) return;
+      if (pcmChunks.length === 0 || totalBytes < 2) {
+        return;
+      }
 
-      // CONCAT PCM
+      // concat PCM
       const pcmBuffer = Buffer.concat(pcmChunks);
       pcmChunks = [];
 
-      // AUDIO STATS
+      // stats
       const { samples, min, max, rms, peak } = pcm16Stats(pcmBuffer);
-
       const durationMs = Math.round((samples / 16000) * 1000);
 
       console.log("[AUDIO IN]", {
@@ -104,7 +123,7 @@ wss.on("connection", (ws) => {
         peak: Number(peak.toFixed(5)),
       });
 
-      // WAV BUILD
+      // build wav
       const header = wavHeader({
         sampleRate: 16000,
         numChannels: 1,
@@ -119,7 +138,7 @@ wss.on("connection", (ws) => {
         durationMs,
       });
 
-      // DEBUG WAV (1 sur 5)
+      // dump wav 1/5 flush
       debugCounter++;
       if (debugCounter % 5 === 0) {
         const file = `/tmp/instanttalk_debug_${Date.now()}.wav`;
@@ -127,19 +146,33 @@ wss.on("connection", (ws) => {
         console.log("[DEBUG WAV] saved:", file);
       }
 
-      // ====== APPEL WHISPER ======
+      // TODO: replace with your existing Whisper call
       await sendToWhisper(wavBuffer);
+
+      // optional: notify client (debug)
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "server_debug",
+            audio: { durationMs, rms: Number(rms.toFixed(5)), peak: Number(peak.toFixed(5)) },
+          })
+        );
+      } catch {}
     }
   });
 
-  ws.on("close", () => {
-    console.log("Client disconnected");
-  });
+  ws.on("close", () => console.log("[WS] client disconnected"));
+  ws.on("error", (e) => console.log("[WS] error", e?.message || e));
 });
 
-// ================= WHISPER CALL =================
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`[HTTP] listening on ${PORT}`);
+});
 
+// ================= WHISPER PLACEHOLDER =================
+// Remplace uniquement le contenu par TON code Whisper existant
 async function sendToWhisper(wavBuffer) {
-  // Remplace par ton appel OpenAI existant
-  console.log("Sending to Whisper...");
+  // IMPORTANT: This is a placeholder. Plug your OpenAI Whisper request here.
+  // For now just log to confirm the pipeline works.
+  console.log("[WHISPER] (placeholder) got wav bytes:", wavBuffer.length);
 }
