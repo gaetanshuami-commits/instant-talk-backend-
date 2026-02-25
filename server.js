@@ -1,21 +1,27 @@
 /**
- * server.js — Instant Talk Global (Railway) — STABLE + FULL LOGS + RETRIES
+ * server.js — Instant Talk Backend (Railway) — CLEAN + STABLE + FULL LOGS
  *
- * WS: /ws
- * Audio in: PCM Int16 LE mono 16kHz (binary frames)
- * Control in: JSON strings (e.g. {"type":"flush"}, {"type":"config", ...})
+ * WebSocket: /ws
+ * Audio input: PCM Int16 LE, mono, 16kHz (binary frames)
+ * Control input: JSON (string) messages, e.g.:
+ *   {"type":"config","sourceLang":"fr","targetLang":"en","voice":"alloy"}
+ *   {"type":"flush"}
+ *   {"type":"reset"}
  *
- * Output (always one of):
- *   {type:"stt", ...}
- *   {type:"translation", ...}
- *   {type:"tts", ...}
- *   OR {type:"error", ...}
+ * Backend responses (ALWAYS):
+ *   {type:"stt", text, model, ms, seq}
+ *   {type:"translation", text, provider, sourceLang, targetLang, ms, seq}
+ *   {type:"tts", audioB64, mime:"audio/mpeg", bytes, model, voice, ms, seq}
+ *   OR {type:"error", stage, message, details}
  *
- * Fixes included:
- * - DeepL 403 "Wrong endpoint" => automatic retry api.deepl.com <-> api-free.deepl.com
- * - OpenAI model name mismatch => automatic fallback:
- *      STT: env OPENAI_STT_MODEL -> gpt-4o-mini-transcribe -> whisper-1
- *      TTS: env OPENAI_TTS_MODEL -> gpt-4o-mini-tts -> tts-1
+ * Fixes implemented (as per Base44 message + your screenshot):
+ * - DeepL endpoint chosen based on key type:
+ *     - if key endsWith(":fx") => api-free.deepl.com
+ *     - else => api.deepl.com
+ *   plus safety retry if DeepL returns "Wrong endpoint"
+ * - OpenAI model names configurable via Railway Variables:
+ *     OPENAI_STT_MODEL default whisper-1
+ *     OPENAI_TTS_MODEL default tts-1
  */
 
 import http from "http";
@@ -28,46 +34,52 @@ import { WebSocketServer } from "ws";
 import OpenAI from "openai";
 
 // -------------------------
-// Env / Config
+// ENV
 // -------------------------
 const PORT = Number(process.env.PORT || 3000);
 const WS_PATH = "/ws";
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 if (!OPENAI_API_KEY) {
   console.error("[FATAL] Missing OPENAI_API_KEY");
   process.exit(1);
 }
 
-const OPENAI_STT_MODEL_ENV = (process.env.OPENAI_STT_MODEL || "").trim(); // recommend: whisper-1
-const OPENAI_TTS_MODEL_ENV = (process.env.OPENAI_TTS_MODEL || "").trim(); // recommend: tts-1
+// Base44-required defaults:
+const OPENAI_STT_MODEL = (process.env.OPENAI_STT_MODEL || "whisper-1").trim();
+const OPENAI_TTS_MODEL = (process.env.OPENAI_TTS_MODEL || "tts-1").trim();
+
+// Translation model fallback (only used when DeepL is disabled or fails)
 const OPENAI_TRANSLATION_MODEL = (process.env.OPENAI_TRANSLATION_MODEL || "gpt-4o-mini").trim();
 
-const OPENAI_TTS_VOICE = (process.env.OPENAI_TTS_VOICE || "coral").trim();
+// Voice
+const OPENAI_TTS_VOICE = (process.env.OPENAI_TTS_VOICE || "alloy").trim();
 
-const STT_MODEL_CANDIDATES = [
-  ...(OPENAI_STT_MODEL_ENV ? [OPENAI_STT_MODEL_ENV] : []),
-  "gpt-4o-mini-transcribe",
-  "whisper-1",
-];
-
-const TTS_MODEL_CANDIDATES = [
-  ...(OPENAI_TTS_MODEL_ENV ? [OPENAI_TTS_MODEL_ENV] : []),
-  "gpt-4o-mini-tts",
-  "tts-1",
-];
-
+// DeepL
 const DEEPL_API_KEY = (process.env.DEEPL_API_KEY || "").trim();
+
+// Choose correct DeepL endpoint based on key type (Base44)
+const DEEPL_API_URL_PRIMARY = DEEPL_API_KEY
+  ? DEEPL_API_KEY.endsWith(":fx")
+    ? "https://api-free.deepl.com/v2/translate"
+    : "https://api.deepl.com/v2/translate"
+  : "";
+
+// Safety alternate endpoint (in case key type assumption is wrong)
+const DEEPL_API_URL_ALT =
+  DEEPL_API_URL_PRIMARY === "https://api.deepl.com/v2/translate"
+    ? "https://api-free.deepl.com/v2/translate"
+    : "https://api.deepl.com/v2/translate";
 
 // Audio strict
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BITS_PER_SAMPLE = 16;
 
+// Limits / Stability
 const MAX_PCM_BYTES_PER_UTTERANCE = Number(process.env.MAX_PCM_BYTES_PER_UTTERANCE || 3_000_000);
 const MAX_TEXT_CHARS = Number(process.env.MAX_TEXT_CHARS || 2000);
-
-const WS_PING_INTERVAL_MS = Number(process.env.WS_PING_INTERVAL_MS || 15_000);
+const WS_PING_INTERVAL_MS = Number(process.env.WS_PING_INTERVAL_MS || 15000);
 
 // -------------------------
 // OpenAI Client
@@ -75,7 +87,7 @@ const WS_PING_INTERVAL_MS = Number(process.env.WS_PING_INTERVAL_MS || 15_000);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // -------------------------
-// Express App
+// Express
 // -------------------------
 const app = express();
 app.disable("x-powered-by");
@@ -84,19 +96,24 @@ app.get("/", (_req, res) => {
   res.status(200).json({
     ok: true,
     service: "instant-talk-backend",
-    ws: WS_PATH,
-    sttCandidates: STT_MODEL_CANDIDATES,
-    ttsCandidates: TTS_MODEL_CANDIDATES,
-    translationModel: OPENAI_TRANSLATION_MODEL,
+    wsPath: WS_PATH,
+    models: {
+      stt: OPENAI_STT_MODEL,
+      tts: OPENAI_TTS_MODEL,
+      translation: OPENAI_TRANSLATION_MODEL,
+    },
     voice: OPENAI_TTS_VOICE,
-    deepL: Boolean(DEEPL_API_KEY),
+    deepl: {
+      enabled: Boolean(DEEPL_API_KEY),
+      primaryEndpoint: DEEPL_API_URL_PRIMARY || null,
+    },
   });
 });
 
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
 // -------------------------
-// HTTP + WS Server
+// HTTP + WS server
 // -------------------------
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
@@ -115,10 +132,14 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 // -------------------------
-// Helpers
+// Utils
 // -------------------------
 function nowMs() {
   return Date.now();
+}
+
+function makeConnId() {
+  return crypto.randomBytes(8).toString("hex");
 }
 
 function safeJsonParse(str) {
@@ -134,18 +155,35 @@ function sendJson(ws, obj) {
   ws.send(JSON.stringify(obj));
 }
 
-function makeConnId() {
-  return crypto.randomBytes(8).toString("hex");
-}
-
 function truncate(s, max = 220) {
   const str = String(s ?? "");
-  if (str.length <= max) return str;
-  return str.slice(0, max) + "…";
+  return str.length <= max ? str : str.slice(0, max) + "…";
+}
+
+function sanitizeTextForTTS(text) {
+  let t = String(text ?? "").trim();
+  if (!t) return "";
+  if (t.length > MAX_TEXT_CHARS) t = t.slice(0, MAX_TEXT_CHARS);
+  return t;
+}
+
+// DeepL mapping required
+function mapDeepLTargetLang(lang) {
+  const lower = String(lang || "").trim().toLowerCase();
+  if (!lower) return lang;
+  if (lower === "en") return "en-US";
+  if (lower === "pt") return "pt-PT";
+  if (lower === "zh") return "zh-Hans";
+  return lang;
+}
+
+function isDeepLWrongEndpointMessage(rawText) {
+  const t = String(rawText || "");
+  return t.includes("Wrong endpoint") || t.includes("wrong endpoint");
 }
 
 /**
- * WAV header + PCM payload (PCM Int16LE mono 16k)
+ * Build WAV from PCM Int16LE
  */
 function pcm16leToWavBuffer(pcmBuffer, sampleRate, channels, bitsPerSample) {
   const byteRate = (sampleRate * channels * bitsPerSample) / 8;
@@ -172,37 +210,22 @@ function pcm16leToWavBuffer(pcmBuffer, sampleRate, channels, bitsPerSample) {
   return Buffer.concat([header, pcmBuffer]);
 }
 
-function sanitizeTextForTTS(text) {
-  let t = String(text ?? "").trim();
-  if (!t) return "";
-  if (t.length > MAX_TEXT_CHARS) t = t.slice(0, MAX_TEXT_CHARS);
-  return t;
-}
-
-// DeepL target mapping required
-function mapDeepLTargetLang(lang) {
-  const lower = String(lang || "").trim().toLowerCase();
-  if (!lower) return lang;
-  if (lower === "en") return "en-US";
-  if (lower === "pt") return "pt-PT";
-  if (lower === "zh") return "zh-Hans";
-  return lang;
-}
-
-function isDeepLWrongEndpointMessage(rawText) {
-  const t = String(rawText || "");
-  return t.includes("Wrong endpoint") || t.includes("wrong endpoint");
-}
-
+// -------------------------
+// DeepL translate (with correct endpoint + safety retry)
+// -------------------------
 async function deeplTranslate({ text, targetLang }) {
-  const mappedTarget = mapDeepLTargetLang(targetLang);
+  if (!DEEPL_API_KEY) {
+    const err = new Error("DeepL disabled (missing DEEPL_API_KEY)");
+    err.details = { enabled: false };
+    throw err;
+  }
 
-  // Try PRO then FREE (your screenshot says "Use https://api.deepl.com" => likely PRO key)
-  const endpoints = ["https://api.deepl.com/v2/translate", "https://api-free.deepl.com/v2/translate"];
+  const mappedTarget = mapDeepLTargetLang(targetLang);
+  const endpointsToTry = [DEEPL_API_URL_PRIMARY, DEEPL_API_URL_ALT].filter(Boolean);
 
   let lastErr = null;
 
-  for (const endpoint of endpoints) {
+  for (const endpoint of endpointsToTry) {
     const t0 = nowMs();
     try {
       const body = new URLSearchParams();
@@ -220,13 +243,14 @@ async function deeplTranslate({ text, targetLang }) {
       const ms = nowMs() - t0;
 
       if (!resp.ok) {
+        // If wrong endpoint => try other endpoint
         if (resp.status === 403 && isDeepLWrongEndpointMessage(raw)) {
           console.warn(
             `[DEEPL] 403 wrong endpoint on ${endpoint} -> retry other endpoint (msg="${truncate(raw, 160)}")`
           );
-          lastErr = Object.assign(new Error(`DeepL wrong endpoint at ${endpoint}`), {
-            details: { status: resp.status, body: raw, endpoint, ms, mappedTarget },
-          });
+          const err = new Error(`DeepL wrong endpoint at ${endpoint}`);
+          err.details = { status: resp.status, body: raw, endpoint, ms, mappedTarget };
+          lastErr = err;
           continue;
         }
 
@@ -237,29 +261,33 @@ async function deeplTranslate({ text, targetLang }) {
 
       const json = safeJsonParse(raw);
       const out = json?.translations?.[0]?.text;
+
       if (!out) {
         const err = new Error(`DeepL invalid response: ${truncate(raw, 400)}`);
         err.details = { endpoint, ms, mappedTarget };
         throw err;
       }
 
-      return { text: out, provider: "deepl", ms, mappedTarget, endpoint };
+      return { text: out, provider: "deepl", ms, endpoint, mappedTarget };
     } catch (e) {
       lastErr = e;
     }
   }
 
-  throw lastErr || new Error("DeepL failed on all endpoints");
+  throw lastErr || new Error("DeepL failed");
 }
 
+// -------------------------
+// OpenAI translation fallback
+// -------------------------
 async function openaiTranslate({ text, sourceLang, targetLang }) {
   const t0 = nowMs();
 
   const system = [
     "You are a translation engine for real-time voice translation.",
-    "Return ONLY the translated text, no quotes, no explanations, no extra lines.",
-    "Preserve meaning, tone, punctuation, and named entities.",
-    "If input is empty, return empty.",
+    "Return ONLY the translated text.",
+    "No quotes, no explanations, no extra lines.",
+    "Preserve meaning, tone, punctuation, named entities.",
   ].join(" ");
 
   const user = `Translate from ${sourceLang || "auto"} to ${targetLang}:\n\n${text}`;
@@ -279,92 +307,54 @@ async function openaiTranslate({ text, sourceLang, targetLang }) {
   return { text: out, provider: "openai", ms };
 }
 
-// Retry helper: try next model only if error looks like "bad model"
-function isLikelyBadModelError(err) {
-  const msg = String(err?.message || "");
-  return (
-    msg.includes("model") &&
-    (msg.includes("not found") ||
-      msg.includes("No such model") ||
-      msg.includes("does not exist") ||
-      msg.includes("invalid") ||
-      msg.includes("404"))
-  );
-}
-
+// -------------------------
+// OpenAI STT (Whisper)
+// -------------------------
 async function openaiTranscribeWavFile({ wavPath, languageHint }) {
-  let lastErr = null;
+  const t0 = nowMs();
 
-  for (const model of STT_MODEL_CANDIDATES) {
-    const t0 = nowMs();
-    try {
-      const file = fs.createReadStream(wavPath);
-      const transcription = await openai.audio.transcriptions.create({
-        model,
-        file,
-        ...(languageHint ? { language: languageHint } : {}),
-        response_format: "json",
-      });
+  const file = fs.createReadStream(wavPath);
+  const transcription = await openai.audio.transcriptions.create({
+    model: OPENAI_STT_MODEL,
+    file,
+    ...(languageHint ? { language: languageHint } : {}),
+    response_format: "json",
+  });
 
-      const text = (transcription?.text || "").trim();
-      const ms = nowMs() - t0;
+  const text = (transcription?.text || "").trim();
+  const ms = nowMs() - t0;
 
-      return { text, ms, model };
-    } catch (e) {
-      lastErr = e;
-      if (isLikelyBadModelError(e)) {
-        console.warn(`[STT] model="${model}" rejected -> try next. err="${truncate(e?.message, 200)}"`);
-        continue;
-      }
-      throw e;
-    }
-  }
-
-  throw lastErr || new Error("STT failed (no models worked)");
-}
-
-async function openaiTtsMp3({ text, voice }) {
-  let lastErr = null;
-
-  for (const model of TTS_MODEL_CANDIDATES) {
-    const t0 = nowMs();
-    try {
-      const mp3 = await openai.audio.speech.create({
-        model,
-        voice: voice || OPENAI_TTS_VOICE,
-        input: text,
-        response_format: "mp3",
-      });
-
-      const buffer = Buffer.from(await mp3.arrayBuffer());
-      const ms = nowMs() - t0;
-
-      return { buffer, ms, model };
-    } catch (e) {
-      lastErr = e;
-      if (isLikelyBadModelError(e)) {
-        console.warn(`[TTS] model="${model}" rejected -> try next. err="${truncate(e?.message, 200)}"`);
-        continue;
-      }
-      throw e;
-    }
-  }
-
-  throw lastErr || new Error("TTS failed (no models worked)");
+  return { text, ms, model: OPENAI_STT_MODEL };
 }
 
 // -------------------------
-// Connection State
+// OpenAI TTS
+// -------------------------
+async function openaiTtsMp3({ text, voice }) {
+  const t0 = nowMs();
+
+  const mp3 = await openai.audio.speech.create({
+    model: OPENAI_TTS_MODEL,
+    voice: voice || OPENAI_TTS_VOICE,
+    input: text,
+    response_format: "mp3",
+  });
+
+  const buffer = Buffer.from(await mp3.arrayBuffer());
+  const ms = nowMs() - t0;
+
+  return { buffer, ms, model: OPENAI_TTS_MODEL };
+}
+
+// -------------------------
+// Connection state
 // -------------------------
 function makeDefaultSessionConfig() {
   return {
-    sourceLang: "",
+    sourceLang: "", // "" => auto
     targetLang: "en",
     auto_bidi: false,
     voice: OPENAI_TTS_VOICE,
-    room: "",
-    participantId: "",
-    participantName: "",
   };
 }
 
@@ -376,7 +366,7 @@ function makeConnectionState() {
     pcmBytes: 0,
     isProcessing: false,
     pendingFlush: false,
-    utteranceSeq: 0,
+    seq: 0,
   };
 }
 
@@ -391,7 +381,7 @@ function appendPcm(state, buf) {
 }
 
 // -------------------------
-// WS Handling
+// WS
 // -------------------------
 wss.on("connection", (ws, req) => {
   const state = makeConnectionState();
@@ -407,17 +397,18 @@ wss.on("connection", (ws, req) => {
     type: "ready",
     id: state.id,
     wsPath: WS_PATH,
-    sttCandidates: STT_MODEL_CANDIDATES,
-    ttsCandidates: TTS_MODEL_CANDIDATES,
-    translationModel: OPENAI_TRANSLATION_MODEL,
+    models: {
+      stt: OPENAI_STT_MODEL,
+      tts: OPENAI_TTS_MODEL,
+      translation: OPENAI_TRANSLATION_MODEL,
+    },
     voice: state.config.voice,
-    deepL: Boolean(DEEPL_API_KEY),
+    deepl: { enabled: Boolean(DEEPL_API_KEY), endpoint: DEEPL_API_URL_PRIMARY || null },
   });
 
+  // keepalive
   ws.isAlive = true;
-  ws.on("pong", () => {
-    ws.isAlive = true;
-  });
+  ws.on("pong", () => (ws.isAlive = true));
 
   const pingTimer = setInterval(() => {
     if (ws.readyState !== ws.OPEN) return;
@@ -436,16 +427,13 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", (code, reason) => {
     clearInterval(pingTimer);
-    console.log(
-      `[WS][${state.id}] closed code=${code} reason=${truncate(reason?.toString?.() || "", 120)}`
-    );
+    console.log(`[WS][${state.id}] closed code=${code} reason=${truncate(reason?.toString?.() || "", 120)}`);
   });
 
-  ws.on("error", (err) => {
-    console.error(`[WS][${state.id}] error`, err);
-  });
+  ws.on("error", (err) => console.error(`[WS][${state.id}] error`, err));
 
   ws.on("message", async (data, isBinary) => {
+    // Binary audio frame
     if (isBinary) {
       const buf = Buffer.from(data);
 
@@ -457,9 +445,7 @@ wss.on("connection", (ws, req) => {
       }
 
       if (state.pcmBytes > MAX_PCM_BYTES_PER_UTTERANCE) {
-        console.error(
-          `[AUDIO][${state.id}] buffer overflow pcmBytes=${state.pcmBytes} > max=${MAX_PCM_BYTES_PER_UTTERANCE}`
-        );
+        console.error(`[AUDIO][${state.id}] overflow pcmBytes=${state.pcmBytes} max=${MAX_PCM_BYTES_PER_UTTERANCE}`);
         resetAudioBuffer(state);
         sendJson(ws, {
           type: "error",
@@ -471,6 +457,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
+    // Text control message
     const str = data.toString("utf8");
     const msg = safeJsonParse(str);
     if (!msg || typeof msg !== "object") {
@@ -487,16 +474,11 @@ wss.on("connection", (ws, req) => {
       if (typeof msg.targetLang === "string") next.targetLang = msg.targetLang.trim();
       if (typeof msg.auto_bidi === "boolean") next.auto_bidi = msg.auto_bidi;
       if (typeof msg.voice === "string" && msg.voice.trim()) next.voice = msg.voice.trim();
-      if (typeof msg.room === "string") next.room = msg.room.trim();
-      if (typeof msg.participantId === "string") next.participantId = msg.participantId.trim();
-      if (typeof msg.participantName === "string") next.participantName = msg.participantName.trim();
 
       state.config = next;
 
       console.log(
-        `[CFG][${state.id}] sourceLang=${next.sourceLang || "auto"} targetLang=${next.targetLang} auto_bidi=${
-          next.auto_bidi
-        } voice=${next.voice}`
+        `[CFG][${state.id}] sourceLang=${next.sourceLang || "auto"} targetLang=${next.targetLang} auto_bidi=${next.auto_bidi} voice=${next.voice}`
       );
 
       sendJson(ws, { type: "config_ack", config: next });
@@ -518,7 +500,6 @@ wss.on("connection", (ws, req) => {
         sendJson(ws, { type: "flush_ack", status: "queued" });
         return;
       }
-
       await processUtterance(ws, state, msg);
       return;
     }
@@ -528,13 +509,13 @@ wss.on("connection", (ws, req) => {
 });
 
 // -------------------------
-// Core pipeline
+// Pipeline
 // -------------------------
 async function processUtterance(ws, state, flushMsg) {
   state.isProcessing = true;
   state.pendingFlush = false;
 
-  const seq = ++state.utteranceSeq;
+  const seq = ++state.seq;
   const startedAt = nowMs();
 
   const meta = {
@@ -548,19 +529,22 @@ async function processUtterance(ws, state, flushMsg) {
   try {
     if (state.pcmBytes <= 0) {
       console.warn(`[FLUSH][${state.id}][#${seq}] no audio`);
-      sendJson(ws, { type: "error", stage: "ingest", message: "Flush but no audio buffered.", details: meta });
+      sendJson(ws, {
+        type: "error",
+        stage: "ingest",
+        message: "Flush received but no audio buffered.",
+        details: meta,
+      });
       return;
     }
 
     const pcm = Buffer.concat(state.pcmChunks, state.pcmBytes);
     resetAudioBuffer(state);
 
-    console.log(
-      `[PIPE][${state.id}][#${seq}] start pcmBytes=${pcm.length} src=${meta.sourceLang} tgt=${meta.targetLang} voice=${meta.voice}`
-    );
+    console.log(`[PIPE][${state.id}][#${seq}] start pcmBytes=${pcm.length} src=${meta.sourceLang} tgt=${meta.targetLang}`);
 
+    // WAV
     const wav = pcm16leToWavBuffer(pcm, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS_PER_SAMPLE);
-
     const wavPath = path.join(os.tmpdir(), `utt_${state.id}_${seq}_${Date.now()}.wav`);
     fs.writeFileSync(wavPath, wav);
 
@@ -568,15 +552,7 @@ async function processUtterance(ws, state, flushMsg) {
     const stt = await openaiTranscribeWavFile({ wavPath, languageHint: state.config.sourceLang || undefined });
     console.log(`[STT][${state.id}][#${seq}] model=${stt.model} ms=${stt.ms} text="${truncate(stt.text, 240)}"`);
 
-    sendJson(ws, {
-      type: "stt",
-      text: stt.text,
-      lang: meta.sourceLang,
-      ms: stt.ms,
-      model: stt.model,
-      seq,
-      pcmBytes: pcm.length,
-    });
+    sendJson(ws, { type: "stt", text: stt.text, model: stt.model, ms: stt.ms, seq });
 
     try {
       fs.unlinkSync(wavPath);
@@ -593,7 +569,7 @@ async function processUtterance(ws, state, flushMsg) {
     const tgt = (state.config.targetLang || "").trim() || "en";
 
     let translatedText = sttText;
-    let translationProvider = "none";
+    let provider = "none";
     let translationMs = 0;
 
     if (src && tgt && src.toLowerCase() === tgt.toLowerCase()) {
@@ -601,21 +577,32 @@ async function processUtterance(ws, state, flushMsg) {
     } else {
       const t0 = nowMs();
       if (DEEPL_API_KEY) {
-        const r = await deeplTranslate({ text: sttText, targetLang: tgt });
-        translatedText = r.text;
-        translationProvider = "deepl";
-        translationMs = nowMs() - t0;
+        try {
+          const r = await deeplTranslate({ text: sttText, targetLang: tgt });
+          translatedText = r.text;
+          provider = "deepl";
+          translationMs = nowMs() - t0;
 
-        console.log(
-          `[TRANSL][${state.id}][#${seq}] provider=deepl ms=${translationMs} endpoint=${r.endpoint} mappedTarget=${r.mappedTarget} text="${truncate(
-            translatedText,
-            240
-          )}"`
-        );
+          console.log(
+            `[TRANSL][${state.id}][#${seq}] provider=deepl ms=${translationMs} endpoint=${r.endpoint} mappedTarget=${r.mappedTarget} text="${truncate(
+              translatedText,
+              240
+            )}"`
+          );
+        } catch (deeplErr) {
+          // If DeepL fails, fallback OpenAI translation (so pipeline never blocks)
+          console.warn(`[TRANSL][${state.id}][#${seq}] DeepL failed -> fallback OpenAI. err="${truncate(deeplErr?.message, 240)}"`);
+          const r = await openaiTranslate({ text: sttText, sourceLang: src || "auto", targetLang: tgt });
+          translatedText = r.text;
+          provider = "openai_fallback";
+          translationMs = nowMs() - t0;
+
+          console.log(`[TRANSL][${state.id}][#${seq}] provider=openai_fallback ms=${translationMs} text="${truncate(translatedText, 240)}"`);
+        }
       } else {
         const r = await openaiTranslate({ text: sttText, sourceLang: src || "auto", targetLang: tgt });
         translatedText = r.text;
-        translationProvider = "openai";
+        provider = "openai";
         translationMs = nowMs() - t0;
 
         console.log(`[TRANSL][${state.id}][#${seq}] provider=openai ms=${translationMs} text="${truncate(translatedText, 240)}"`);
@@ -625,9 +612,9 @@ async function processUtterance(ws, state, flushMsg) {
     sendJson(ws, {
       type: "translation",
       text: translatedText,
+      provider,
       sourceLang: src || "auto",
       targetLang: tgt,
-      provider: translationProvider,
       ms: translationMs,
       seq,
     });
@@ -638,7 +625,7 @@ async function processUtterance(ws, state, flushMsg) {
         type: "error",
         stage: "translation",
         message: "Translation returned empty text.",
-        details: { ...meta, provider: translationProvider },
+        details: { ...meta, provider },
       });
       return;
     }
@@ -652,9 +639,9 @@ async function processUtterance(ws, state, flushMsg) {
       audioB64: tts.buffer.toString("base64"),
       mime: "audio/mpeg",
       bytes: tts.buffer.length,
+      model: tts.model,
       voice: meta.voice,
       ms: tts.ms,
-      model: tts.model,
       seq,
     });
 
@@ -688,6 +675,7 @@ async function processUtterance(ws, state, flushMsg) {
   } finally {
     state.isProcessing = false;
 
+    // If a flush arrived during processing, handle it immediately if audio exists
     if (state.pendingFlush) {
       state.pendingFlush = false;
       if (state.pcmBytes > 0 && ws.readyState === ws.OPEN) {
@@ -708,8 +696,12 @@ async function processUtterance(ws, state, flushMsg) {
 server.listen(PORT, () => {
   console.log(`[BOOT] listening :${PORT}`);
   console.log(`[BOOT] WS path: ${WS_PATH}`);
-  console.log(`[BOOT] STT candidates: ${STT_MODEL_CANDIDATES.join(", ")}`);
-  console.log(`[BOOT] TTS candidates: ${TTS_MODEL_CANDIDATES.join(", ")}`);
-  console.log(`[BOOT] Translation model: ${OPENAI_TRANSLATION_MODEL}`);
+  console.log(`[BOOT] OpenAI STT model: ${OPENAI_STT_MODEL}`);
+  console.log(`[BOOT] OpenAI TTS model: ${OPENAI_TTS_MODEL}`);
+  console.log(`[BOOT] OpenAI Translation model: ${OPENAI_TRANSLATION_MODEL}`);
   console.log(`[BOOT] DeepL enabled: ${Boolean(DEEPL_API_KEY)}`);
+  if (DEEPL_API_KEY) {
+    console.log(`[BOOT] DeepL endpoint(primary): ${DEEPL_API_URL_PRIMARY}`);
+    console.log(`[BOOT] DeepL endpoint(alt): ${DEEPL_API_URL_ALT}`);
+  }
 });
