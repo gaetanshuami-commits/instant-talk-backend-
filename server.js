@@ -1,27 +1,18 @@
 /**
- * server.js — Instant Talk Backend (Railway) — CLEAN + STABLE + FULL LOGS
+ * server.js — Instant Talk Backend (Railway) — STABLE + FULL LOGS + ANTI-EMPTY
  *
- * WebSocket: /ws
- * Audio input: PCM Int16 LE, mono, 16kHz (binary frames)
- * Control input: JSON (string) messages, e.g.:
- *   {"type":"config","sourceLang":"fr","targetLang":"en","voice":"alloy"}
- *   {"type":"flush"}
- *   {"type":"reset"}
+ * WS: /ws
+ * Audio in: PCM Int16 LE mono 16kHz (binary frames)
+ * Control in: JSON (string): config / flush / reset
  *
- * Backend responses (ALWAYS):
- *   {type:"stt", text, model, ms, seq}
- *   {type:"translation", text, provider, sourceLang, targetLang, ms, seq}
- *   {type:"tts", audioB64, mime:"audio/mpeg", bytes, model, voice, ms, seq}
- *   OR {type:"error", stage, message, details}
+ * Output (always):
+ *   {type:"stt"} {type:"translation"} {type:"tts"} OR {type:"error"}
  *
- * Fixes implemented (as per Base44 message + your screenshot):
- * - DeepL endpoint chosen based on key type:
- *     - if key endsWith(":fx") => api-free.deepl.com
- *     - else => api.deepl.com
- *   plus safety retry if DeepL returns "Wrong endpoint"
- * - OpenAI model names configurable via Railway Variables:
- *     OPENAI_STT_MODEL default whisper-1
- *     OPENAI_TTS_MODEL default tts-1
+ * Key improvements vs previous:
+ * - Logs durationMs for each flush
+ * - Reject too-short audio segments (prevents "STT returned empty text")
+ * - Keeps DeepL endpoint selection based on :fx + safety retry
+ * - Models read from Railway vars: OPENAI_STT_MODEL=whisper-1, OPENAI_TTS_MODEL=tts-1
  */
 
 import http from "http";
@@ -45,27 +36,21 @@ if (!OPENAI_API_KEY) {
   process.exit(1);
 }
 
-// Base44-required defaults:
 const OPENAI_STT_MODEL = (process.env.OPENAI_STT_MODEL || "whisper-1").trim();
 const OPENAI_TTS_MODEL = (process.env.OPENAI_TTS_MODEL || "tts-1").trim();
-
-// Translation model fallback (only used when DeepL is disabled or fails)
 const OPENAI_TRANSLATION_MODEL = (process.env.OPENAI_TRANSLATION_MODEL || "gpt-4o-mini").trim();
 
-// Voice
 const OPENAI_TTS_VOICE = (process.env.OPENAI_TTS_VOICE || "alloy").trim();
 
-// DeepL
 const DEEPL_API_KEY = (process.env.DEEPL_API_KEY || "").trim();
 
-// Choose correct DeepL endpoint based on key type (Base44)
+// DeepL endpoint selection (Base44)
 const DEEPL_API_URL_PRIMARY = DEEPL_API_KEY
   ? DEEPL_API_KEY.endsWith(":fx")
     ? "https://api-free.deepl.com/v2/translate"
     : "https://api.deepl.com/v2/translate"
   : "";
 
-// Safety alternate endpoint (in case key type assumption is wrong)
 const DEEPL_API_URL_ALT =
   DEEPL_API_URL_PRIMARY === "https://api.deepl.com/v2/translate"
     ? "https://api-free.deepl.com/v2/translate"
@@ -75,14 +60,18 @@ const DEEPL_API_URL_ALT =
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BITS_PER_SAMPLE = 16;
+const BYTES_PER_SAMPLE = AUDIO_BITS_PER_SAMPLE / 8; // 2 bytes for int16
 
 // Limits / Stability
 const MAX_PCM_BYTES_PER_UTTERANCE = Number(process.env.MAX_PCM_BYTES_PER_UTTERANCE || 3_000_000);
 const MAX_TEXT_CHARS = Number(process.env.MAX_TEXT_CHARS || 2000);
 const WS_PING_INTERVAL_MS = Number(process.env.WS_PING_INTERVAL_MS || 15000);
 
+// Anti-empty STT: reject segments too short
+const MIN_AUDIO_MS_FOR_STT = Number(process.env.MIN_AUDIO_MS_FOR_STT || 250); // 0.25s default
+
 // -------------------------
-// OpenAI Client
+// OpenAI
 // -------------------------
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
@@ -106,6 +95,12 @@ app.get("/", (_req, res) => {
     deepl: {
       enabled: Boolean(DEEPL_API_KEY),
       primaryEndpoint: DEEPL_API_URL_PRIMARY || null,
+    },
+    audio: {
+      sampleRate: AUDIO_SAMPLE_RATE,
+      channels: AUDIO_CHANNELS,
+      bits: AUDIO_BITS_PER_SAMPLE,
+      minMsForStt: MIN_AUDIO_MS_FOR_STT,
     },
   });
 });
@@ -182,6 +177,14 @@ function isDeepLWrongEndpointMessage(rawText) {
   return t.includes("Wrong endpoint") || t.includes("wrong endpoint");
 }
 
+function pcmBytesToDurationMs(pcmBytes) {
+  // bytes / (sampleRate * channels * bytesPerSample) = seconds
+  const denom = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * BYTES_PER_SAMPLE;
+  if (!denom) return 0;
+  const seconds = pcmBytes / denom;
+  return Math.round(seconds * 1000);
+}
+
 /**
  * Build WAV from PCM Int16LE
  */
@@ -211,7 +214,7 @@ function pcm16leToWavBuffer(pcmBuffer, sampleRate, channels, bitsPerSample) {
 }
 
 // -------------------------
-// DeepL translate (with correct endpoint + safety retry)
+// DeepL translate
 // -------------------------
 async function deeplTranslate({ text, targetLang }) {
   if (!DEEPL_API_KEY) {
@@ -243,17 +246,13 @@ async function deeplTranslate({ text, targetLang }) {
       const ms = nowMs() - t0;
 
       if (!resp.ok) {
-        // If wrong endpoint => try other endpoint
         if (resp.status === 403 && isDeepLWrongEndpointMessage(raw)) {
-          console.warn(
-            `[DEEPL] 403 wrong endpoint on ${endpoint} -> retry other endpoint (msg="${truncate(raw, 160)}")`
-          );
+          console.warn(`[DEEPL] 403 wrong endpoint on ${endpoint} -> retry other endpoint`);
           const err = new Error(`DeepL wrong endpoint at ${endpoint}`);
           err.details = { status: resp.status, body: raw, endpoint, ms, mappedTarget };
           lastErr = err;
           continue;
         }
-
         const err = new Error(`DeepL HTTP ${resp.status}: ${truncate(raw, 400)}`);
         err.details = { status: resp.status, body: raw, endpoint, ms, mappedTarget };
         throw err;
@@ -308,7 +307,7 @@ async function openaiTranslate({ text, sourceLang, targetLang }) {
 }
 
 // -------------------------
-// OpenAI STT (Whisper)
+// OpenAI STT
 // -------------------------
 async function openaiTranscribeWavFile({ wavPath, languageHint }) {
   const t0 = nowMs();
@@ -433,7 +432,6 @@ wss.on("connection", (ws, req) => {
   ws.on("error", (err) => console.error(`[WS][${state.id}] error`, err));
 
   ws.on("message", async (data, isBinary) => {
-    // Binary audio frame
     if (isBinary) {
       const buf = Buffer.from(data);
 
@@ -457,7 +455,6 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // Text control message
     const str = data.toString("utf8");
     const msg = safeJsonParse(str);
     if (!msg || typeof msg !== "object") {
@@ -518,9 +515,12 @@ async function processUtterance(ws, state, flushMsg) {
   const seq = ++state.seq;
   const startedAt = nowMs();
 
+  const durationMs = pcmBytesToDurationMs(state.pcmBytes);
+
   const meta = {
     seq,
     pcmBytes: state.pcmBytes,
+    durationMs,
     sourceLang: state.config.sourceLang || "auto",
     targetLang: state.config.targetLang || "en",
     voice: state.config.voice || OPENAI_TTS_VOICE,
@@ -529,11 +529,19 @@ async function processUtterance(ws, state, flushMsg) {
   try {
     if (state.pcmBytes <= 0) {
       console.warn(`[FLUSH][${state.id}][#${seq}] no audio`);
+      sendJson(ws, { type: "error", stage: "ingest", message: "Flush received but no audio buffered.", details: meta });
+      return;
+    }
+
+    // Anti-empty STT: too short => skip STT entirely
+    if (durationMs < MIN_AUDIO_MS_FOR_STT) {
+      console.warn(`[PIPE][${state.id}][#${seq}] too_short durationMs=${durationMs} < min=${MIN_AUDIO_MS_FOR_STT} -> skip STT`);
+      resetAudioBuffer(state);
       sendJson(ws, {
         type: "error",
-        stage: "ingest",
-        message: "Flush received but no audio buffered.",
-        details: meta,
+        stage: "stt",
+        message: `Audio segment too short (${durationMs}ms).`,
+        details: { ...meta, code: "too_short", minMs: MIN_AUDIO_MS_FOR_STT },
       });
       return;
     }
@@ -541,7 +549,9 @@ async function processUtterance(ws, state, flushMsg) {
     const pcm = Buffer.concat(state.pcmChunks, state.pcmBytes);
     resetAudioBuffer(state);
 
-    console.log(`[PIPE][${state.id}][#${seq}] start pcmBytes=${pcm.length} src=${meta.sourceLang} tgt=${meta.targetLang}`);
+    console.log(
+      `[PIPE][${state.id}][#${seq}] start pcmBytes=${pcm.length} durationMs=${durationMs} src=${meta.sourceLang} tgt=${meta.targetLang}`
+    );
 
     // WAV
     const wav = pcm16leToWavBuffer(pcm, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS_PER_SAMPLE);
@@ -549,7 +559,11 @@ async function processUtterance(ws, state, flushMsg) {
     fs.writeFileSync(wavPath, wav);
 
     // STT
-    const stt = await openaiTranscribeWavFile({ wavPath, languageHint: state.config.sourceLang || undefined });
+    const stt = await openaiTranscribeWavFile({
+      wavPath,
+      languageHint: state.config.sourceLang || undefined,
+    });
+
     console.log(`[STT][${state.id}][#${seq}] model=${stt.model} ms=${stt.ms} text="${truncate(stt.text, 240)}"`);
 
     sendJson(ws, { type: "stt", text: stt.text, model: stt.model, ms: stt.ms, seq });
@@ -582,7 +596,6 @@ async function processUtterance(ws, state, flushMsg) {
           translatedText = r.text;
           provider = "deepl";
           translationMs = nowMs() - t0;
-
           console.log(
             `[TRANSL][${state.id}][#${seq}] provider=deepl ms=${translationMs} endpoint=${r.endpoint} mappedTarget=${r.mappedTarget} text="${truncate(
               translatedText,
@@ -590,13 +603,11 @@ async function processUtterance(ws, state, flushMsg) {
             )}"`
           );
         } catch (deeplErr) {
-          // If DeepL fails, fallback OpenAI translation (so pipeline never blocks)
           console.warn(`[TRANSL][${state.id}][#${seq}] DeepL failed -> fallback OpenAI. err="${truncate(deeplErr?.message, 240)}"`);
           const r = await openaiTranslate({ text: sttText, sourceLang: src || "auto", targetLang: tgt });
           translatedText = r.text;
           provider = "openai_fallback";
           translationMs = nowMs() - t0;
-
           console.log(`[TRANSL][${state.id}][#${seq}] provider=openai_fallback ms=${translationMs} text="${truncate(translatedText, 240)}"`);
         }
       } else {
@@ -604,7 +615,6 @@ async function processUtterance(ws, state, flushMsg) {
         translatedText = r.text;
         provider = "openai";
         translationMs = nowMs() - t0;
-
         console.log(`[TRANSL][${state.id}][#${seq}] provider=openai ms=${translationMs} text="${truncate(translatedText, 240)}"`);
       }
     }
@@ -663,6 +673,7 @@ async function processUtterance(ws, state, flushMsg) {
         totalMs,
         config: state.config,
         pcmBytesAtFlush: meta.pcmBytes,
+        durationMs: meta.durationMs,
         flushMsg: flushMsg && typeof flushMsg === "object" ? flushMsg : null,
         error: {
           name: err?.name || "Error",
@@ -675,7 +686,6 @@ async function processUtterance(ws, state, flushMsg) {
   } finally {
     state.isProcessing = false;
 
-    // If a flush arrived during processing, handle it immediately if audio exists
     if (state.pendingFlush) {
       state.pendingFlush = false;
       if (state.pcmBytes > 0 && ws.readyState === ws.OPEN) {
@@ -704,4 +714,5 @@ server.listen(PORT, () => {
     console.log(`[BOOT] DeepL endpoint(primary): ${DEEPL_API_URL_PRIMARY}`);
     console.log(`[BOOT] DeepL endpoint(alt): ${DEEPL_API_URL_ALT}`);
   }
+  console.log(`[BOOT] MIN_AUDIO_MS_FOR_STT: ${MIN_AUDIO_MS_FOR_STT}`);
 });
