@@ -1,422 +1,444 @@
 // server.js (ESM) — Instant Talk Backend (Railway)
-// WS protocol:
-// - client sends JSON: {type:"start", from, to, sampleRate:16000, channels:1} OR {type:"start", mode:"auto_bidi", langs:["fr","en"], sampleRate:16000, channels:1}
-// - client sends binary audio chunks: PCM16 LE mono 16kHz (ArrayBuffer)
-// - client sends JSON: {type:"flush"} to trigger STT+translate+TTS
-// - client sends JSON: {type:"stop"}
-// Server replies:
-// - {type:"stt", text, sourceLang?}
-// - {type:"translation", text, sourceLang?, targetLang?}
-// - {type:"tts", audio:"<base64 mp3>", format:"mp3"}
-// - {type:"error", message}
+// WS: /ws   HTTP health: /health
+// Receives: JSON start/flush/stop + binary PCM16LE mono 16kHz
+// Produces: {type:"stt"} {type:"translation"} {type:"tts"} {type:"error"}
 
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import http from 'http';
-import { WebSocketServer } from 'ws';
-import OpenAI, { toFile } from 'openai';
-import * as deepl from 'deepl-node';
+import http from "http";
+import express from "express";
+import { WebSocketServer } from "ws";
+import crypto from "crypto";
 
-// -------------------- ENV --------------------
-const PORT = process.env.PORT || 8081;
+const PORT = Number(process.env.PORT || 8080);
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error('[FATAL] Missing OPENAI_API_KEY in env');
-  process.exit(1);
-}
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const DEEPL_API_KEY = process.env.DEEPL_API_KEY || "";
 
-const DEEPL_API_KEY = process.env.DEEPL_API_KEY || '';
-const USE_DEEPL = Boolean(DEEPL_API_KEY);
+// Models (override via env if you want)
+const OPENAI_STT_MODEL = process.env.OPENAI_STT_MODEL || "whisper-1";
+const OPENAI_TTS_MODEL = process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts";
 
-const STT_MODEL = process.env.STT_MODEL || 'whisper-1';     // stable default
-const TTS_MODEL = process.env.TTS_MODEL || 'tts-1';         // or tts-1-hd
-const TRANSLATE_MODEL = process.env.TRANSLATE_MODEL || 'gpt-4o-mini';
+// Audio format expected from frontend
+const SAMPLE_RATE = 16000;
+const CHANNELS = 1;
+const BITS_PER_SAMPLE = 16;
 
-const MAX_PCM_BYTES_PER_FLUSH = Number(process.env.MAX_PCM_BYTES_PER_FLUSH || (4 * 1024 * 1024)); // 4MB safety
-const WS_PATH = '/ws';
-
-// -------------------- APP --------------------
-const app = express();
-app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
-
-app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'instant-talk-backend', ws: WS_PATH, time: new Date().toISOString() });
-});
-
-const server = http.createServer(app);
-
-// -------------------- WS --------------------
-const wss = new WebSocketServer({ noServer: true });
-
-server.on('upgrade', (req, socket, head) => {
-  try {
-    const url = new URL(req.url || '', `http://${req.headers.host}`);
-    const pathname = url.pathname || '/';
-
-    if (pathname !== WS_PATH) {
-      // Close with 1008 (policy violation) so client sees "endpoint not found"
-      socket.write(
-        'HTTP/1.1 400 Bad Request\r\n' +
-        'Connection: close\r\n' +
-        'Content-Type: text/plain\r\n' +
-        '\r\n' +
-        `WebSocket endpoint not found. Use ${WS_PATH}\n`
-      );
-      socket.destroy();
-      return;
-    }
-
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req);
-    });
-  } catch (e) {
-    socket.destroy();
-  }
-});
-
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-const deeplTranslator = USE_DEEPL ? new deepl.Translator(DEEPL_API_KEY) : null;
-
+// ---- Helpers ----
 function nowIso() {
   return new Date().toISOString();
 }
 
 function log(...args) {
-  console.log(`[${nowIso()}]`, ...args);
+  console.log(nowIso(), ...args);
 }
 
-function safeJsonParse(text) {
-  try { return JSON.parse(text); } catch { return null; }
+function warn(...args) {
+  console.warn(nowIso(), ...args);
 }
 
-// Build a strict WAV (PCM16 LE mono 16kHz) from raw PCM bytes
-function pcm16leToWavBuffer(pcmBuf, sampleRate = 16000, channels = 1) {
-  const bytesPerSample = 2;
-  const blockAlign = channels * bytesPerSample;
-  const byteRate = sampleRate * blockAlign;
+function errLog(...args) {
+  console.error(nowIso(), ...args);
+}
 
-  const dataSize = pcmBuf.length;
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+function mapDeepLLang(code) {
+  // DeepL quirks (common)
+  // - "en" deprecated → use "en-US" or "en-GB"
+  // - "pt" often wants pt-PT or pt-BR
+  // - Chinese often wants zh / zh-hans/zh-hant depending; here we choose zh (or zh-HANS)
+  const c = (code || "").trim();
+
+  if (!c) return c;
+
+  const lower = c.toLowerCase();
+  if (lower === "en") return "en-US";
+  if (lower === "pt") return "pt-PT";
+  if (lower === "zh") return "zh"; // keep simple; adjust if your DeepL plan requires "ZH"
+  return c;
+}
+
+function bufferToWavPCM16Mono(bufferPCM16LE, sampleRate = SAMPLE_RATE) {
+  // WAV header (PCM, mono, 16-bit LE)
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+
+  const dataSize = bufferPCM16LE.length;
   const headerSize = 44;
-  const wavSize = headerSize + dataSize;
+  const wavBuffer = Buffer.alloc(headerSize + dataSize);
 
-  const out = Buffer.alloc(wavSize);
+  // RIFF chunk descriptor
+  wavBuffer.write("RIFF", 0);
+  wavBuffer.writeUInt32LE(36 + dataSize, 4);
+  wavBuffer.write("WAVE", 8);
 
-  // RIFF header
-  out.write('RIFF', 0);
-  out.writeUInt32LE(wavSize - 8, 4);
-  out.write('WAVE', 8);
+  // fmt subchunk
+  wavBuffer.write("fmt ", 12);
+  wavBuffer.writeUInt32LE(16, 16); // PCM
+  wavBuffer.writeUInt16LE(1, 20);  // AudioFormat PCM = 1
+  wavBuffer.writeUInt16LE(numChannels, 22);
+  wavBuffer.writeUInt32LE(sampleRate, 24);
+  wavBuffer.writeUInt32LE(byteRate, 28);
+  wavBuffer.writeUInt16LE(blockAlign, 32);
+  wavBuffer.writeUInt16LE(bitsPerSample, 34);
 
-  // fmt chunk
-  out.write('fmt ', 12);
-  out.writeUInt32LE(16, 16);            // PCM fmt chunk size
-  out.writeUInt16LE(1, 20);             // audio format = PCM
-  out.writeUInt16LE(channels, 22);
-  out.writeUInt32LE(sampleRate, 24);
-  out.writeUInt32LE(byteRate, 28);
-  out.writeUInt16LE(blockAlign, 32);
-  out.writeUInt16LE(16, 34);            // bits per sample
+  // data subchunk
+  wavBuffer.write("data", 36);
+  wavBuffer.writeUInt32LE(dataSize, 40);
 
-  // data chunk
-  out.write('data', 36);
-  out.writeUInt32LE(dataSize, 40);
-  pcmBuf.copy(out, 44);
+  bufferPCM16LE.copy(wavBuffer, 44);
 
-  return out;
+  return wavBuffer;
 }
 
-// Quick RMS/peak for PCM16
-function pcm16RmsPeak(pcmBuf) {
-  const len = Math.floor(pcmBuf.length / 2);
-  if (len <= 0) return { rms: 0, peak: 0 };
+function ensureEvenBytes(buf) {
+  // PCM16 must be multiple of 2 bytes
+  if (buf.length % 2 === 0) return buf;
+  warn("[ALIGN] trimming 1 byte to keep 16-bit alignment. len=", buf.length);
+  return buf.subarray(0, buf.length - 1);
+}
+
+function pcmRmsPeakInt16LE(buf) {
+  // Compute RMS/peak on PCM16LE
+  const n = Math.floor(buf.length / 2);
+  if (n <= 0) return { rms: 0, peak: 0 };
+
   let sumSq = 0;
   let peak = 0;
 
-  for (let i = 0; i < len; i++) {
-    const v = pcmBuf.readInt16LE(i * 2) / 32768;
+  for (let i = 0; i < n; i++) {
+    const v = buf.readInt16LE(i * 2) / 32768;
     const a = Math.abs(v);
     if (a > peak) peak = a;
     sumSq += v * v;
   }
-
-  const rms = Math.sqrt(sumSq / len);
+  const rms = Math.sqrt(sumSq / n);
   return { rms, peak };
 }
 
-async function translateText(text, from, to) {
-  if (!text || !text.trim()) return '';
+async function openaiTranscribeWav(wavBuffer, languageHint = "") {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
-  if (USE_DEEPL && deeplTranslator) {
-    const result = await deeplTranslator.translateText(text, from || null, to || null);
-    return result.text || '';
-  }
+  // OpenAI STT (Whisper)
+  // Uses multipart/form-data
+  const form = new FormData();
+  form.append("model", OPENAI_STT_MODEL);
+  if (languageHint) form.append("language", languageHint);
+  form.append("response_format", "json");
+  form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "audio.wav");
 
-  // OpenAI fallback
-  const prompt = `Translate the following text from ${from || 'the source language'} to ${to || 'the target language'}.
-Return ONLY the translated text, no quotes, no explanations.
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: form,
+  });
 
-TEXT:
-${text}`.trim();
+  const txt = await res.text();
+  if (!res.ok) throw new Error(`OpenAI STT failed (${res.status}): ${txt}`);
 
-  const completion = await openai.chat.completions.create({
-    model: TRANSLATE_MODEL,
+  const json = safeJsonParse(txt) || {};
+  return (json.text || "").toString();
+}
+
+async function deeplTranslate(text, targetLang, sourceLang = "") {
+  if (!DEEPL_API_KEY) throw new Error("Missing DEEPL_API_KEY");
+
+  // DeepL API Free/Pro endpoint difference is your responsibility.
+  // This uses the common endpoint for DeepL Pro; if you use Free, change host accordingly.
+  const url = "https://api.deepl.com/v2/translate";
+
+  const params = new URLSearchParams();
+  params.set("text", text);
+  params.set("target_lang", mapDeepLLang(targetLang));
+  if (sourceLang) params.set("source_lang", mapDeepLLang(sourceLang));
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `DeepL-Auth-Key ${DEEPL_API_KEY}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params,
+  });
+
+  const body = await res.text();
+  if (!res.ok) throw new Error(`DeepL failed (${res.status}): ${body}`);
+
+  const json = safeJsonParse(body);
+  const out = json?.translations?.[0]?.text;
+  return (out || "").toString();
+}
+
+async function openaiTranslate(text, from, to) {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
+  // Minimal translation using chat
+  const payload = {
+    model: process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
     messages: [
-      { role: 'system', content: 'You are a translation engine.' },
-      { role: 'user', content: prompt },
+      { role: "system", content: "You are a high-accuracy translator. Output only the translation text." },
+      { role: "user", content: `Translate from ${from || "auto"} to ${to}: ${text}` },
     ],
     temperature: 0.2,
-  });
-
-  return completion.choices?.[0]?.message?.content?.trim() || '';
-}
-
-async function ttsMp3Base64(text, voice = 'alloy') {
-  if (!text || !text.trim()) return '';
-
-  // openai-node: audio.speech.create returns a fetch Response-like object with arrayBuffer()
-  const resp = await openai.audio.speech.create({
-    model: TTS_MODEL,
-    voice,
-    input: text,
-    format: 'mp3',
-  });
-
-  const ab = await resp.arrayBuffer();
-  return Buffer.from(ab).toString('base64');
-}
-
-async function sttWhisper(wavBuf) {
-  // Use toFile helper so openai SDK sends multipart
-  const file = await toFile(wavBuf, 'audio.wav');
-
-  const result = await openai.audio.transcriptions.create({
-    file,
-    model: STT_MODEL,
-    // language: optional
-    // response_format: 'json'
-  });
-
-  // openai SDK may return {text: "..."} for whisper-1
-  return (result?.text || '').trim();
-}
-
-// -------------------- CONNECTION HANDLER --------------------
-wss.on('connection', (ws, req) => {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  log('[WS] CONNECT', { ip, url: req.url });
-
-  ws.binaryType = 'arraybuffer';
-
-  // session state per connection
-  const session = {
-    started: false,
-    from: 'fr',
-    to: 'en',
-    mode: 'oneway',          // 'oneway' | 'auto_bidi'
-    langs: ['fr', 'en'],
-    sampleRate: 16000,
-    channels: 1,
-    pcmChunks: [],
-    pcmBytes: 0,
-    lastStartAt: Date.now(),
   };
 
-  // Keepalive (some proxies close idle ws)
-  const pingIv = setInterval(() => {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const body = await res.text();
+  if (!res.ok) throw new Error(`OpenAI translate failed (${res.status}): ${body}`);
+
+  const json = safeJsonParse(body);
+  const out = json?.choices?.[0]?.message?.content;
+  return (out || "").trim();
+}
+
+async function openaiTtsMp3(text, voice = "alloy") {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
+  const payload = {
+    model: OPENAI_TTS_MODEL,
+    voice,
+    input: text,
+    format: "mp3",
+  };
+
+  const res = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const e = await res.text();
+    throw new Error(`OpenAI TTS failed (${res.status}): ${e}`);
+  }
+
+  const arr = new Uint8Array(await res.arrayBuffer());
+  return Buffer.from(arr);
+}
+
+// ---- Server ----
+const app = express();
+
+app.get("/", (_req, res) => res.status(200).send("InstantTalk backend up"));
+app.get("/health", (_req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
+
+const server = http.createServer(app);
+
+// WS on /ws
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  const url = new URL(req.url || "", `http://${req.headers.host}`);
+  if (url.pathname !== "/ws") {
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
+});
+
+wss.on("connection", (ws, req) => {
+  const id = crypto.randomBytes(4).toString("hex");
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
+
+  ws.binaryType = "arraybuffer";
+  log(`[WS] CONNECT id=${id} ip=${ip}`);
+
+  // Session state
+  let started = false;
+  let fromLang = "fr";
+  let toLang = "en";
+  let mode = "mono"; // or auto_bidi later
+  let pcmChunks = [];
+  let totalPcmBytes = 0;
+  let lastBinaryAt = Date.now();
+
+  function sendJson(obj) {
     try {
-      if (ws.readyState === ws.OPEN) ws.ping();
+      ws.send(JSON.stringify(obj));
+    } catch (e) {
+      errLog(`[WS] sendJson failed id=${id}`, e?.message || e);
+    }
+  }
+
+  function resetBuffer() {
+    pcmChunks = [];
+    totalPcmBytes = 0;
+  }
+
+  // Heartbeat
+  const pingIv = setInterval(() => {
+    if (ws.readyState !== ws.OPEN) return;
+    try {
+      ws.ping();
     } catch {}
   }, 25000);
 
-  ws.on('close', (code, reason) => {
+  ws.on("pong", () => { /* keepalive */ });
+
+  ws.on("close", (code, reason) => {
     clearInterval(pingIv);
-    log('[WS] CLOSE', { code, reason: reason?.toString?.() });
+    log(`[WS] CLOSE id=${id} code=${code} reason=${reason?.toString?.() || ""}`);
   });
 
-  ws.on('error', (err) => {
-    log('[WS] ERROR', err?.message || err);
+  ws.on("error", (e) => {
+    errLog(`[WS] ERROR id=${id}`, e?.message || e);
   });
 
-  ws.on('message', async (data, isBinary) => {
+  ws.on("message", async (data, isBinary) => {
     try {
-      // ---------------- TEXT / JSON ----------------
-      if (!isBinary) {
-        const text = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
-        const msg = safeJsonParse(text);
+      if (isBinary) {
+        const buf = Buffer.from(data);
+        lastBinaryAt = Date.now();
 
-        if (!msg || !msg.type) {
-          log('[WS] TEXT (ignored)', text?.slice?.(0, 200));
-          return;
+        // Keep alignment
+        const aligned = ensureEvenBytes(buf);
+
+        pcmChunks.push(aligned);
+        totalPcmBytes += aligned.length;
+
+        if (totalPcmBytes % 32000 < aligned.length) {
+          // roughly each second @16k mono int16 => 32000 bytes
+          const { rms, peak } = pcmRmsPeakInt16LE(Buffer.concat(pcmChunks));
+          log(`[AUDIO] id=${id} pcmBytes=${totalPcmBytes} rms=${rms.toFixed(5)} peak=${peak.toFixed(5)}`);
         }
-
-        if (msg.type === 'start') {
-          session.started = true;
-          session.from = msg.from || session.from;
-          session.to = msg.to || session.to;
-          session.sampleRate = Number(msg.sampleRate || session.sampleRate);
-          session.channels = Number(msg.channels || session.channels);
-
-          if (msg.mode === 'auto_bidi') {
-            session.mode = 'auto_bidi';
-            if (Array.isArray(msg.langs) && msg.langs.length >= 2) session.langs = msg.langs;
-          } else {
-            session.mode = 'oneway';
-          }
-
-          session.pcmChunks = [];
-          session.pcmBytes = 0;
-          session.lastStartAt = Date.now();
-
-          log('[WS] START', {
-            mode: session.mode,
-            from: session.from,
-            to: session.to,
-            langs: session.langs,
-            sampleRate: session.sampleRate,
-            channels: session.channels,
-          });
-
-          ws.send(JSON.stringify({ type: 'ack', ok: true, started: true }));
-          return;
-        }
-
-        if (msg.type === 'stop') {
-          log('[WS] STOP');
-          session.started = false;
-          session.pcmChunks = [];
-          session.pcmBytes = 0;
-          ws.send(JSON.stringify({ type: 'ack', ok: true, stopped: true }));
-          return;
-        }
-
-        if (msg.type === 'flush') {
-          if (!session.started) {
-            ws.send(JSON.stringify({ type: 'error', message: 'flush before start' }));
-            return;
-          }
-
-          if (session.pcmBytes <= 0) {
-            log('[WS] FLUSH (empty)');
-            ws.send(JSON.stringify({ type: 'ack', ok: true, flush: 'empty' }));
-            return;
-          }
-
-          // Concat PCM
-          let pcmBuf = Buffer.concat(session.pcmChunks, session.pcmBytes);
-
-          // Align 2 bytes
-          if (pcmBuf.length % 2 !== 0) pcmBuf = pcmBuf.subarray(0, pcmBuf.length - 1);
-
-          const { rms, peak } = pcm16RmsPeak(pcmBuf);
-          const estMs = Math.round((pcmBuf.length / 2 / session.sampleRate) * 1000);
-
-          log('[WS] FLUSH', {
-            bytes: pcmBuf.length,
-            estMs,
-            rms: Number(rms.toFixed(5)),
-            peak: Number(peak.toFixed(5)),
-          });
-
-          // Reset buffer BEFORE heavy work (so next audio can accumulate)
-          session.pcmChunks = [];
-          session.pcmBytes = 0;
-
-          // Safety: reject absurd segments
-          if (pcmBuf.length > MAX_PCM_BYTES_PER_FLUSH) {
-            ws.send(JSON.stringify({ type: 'error', message: `PCM too large (${pcmBuf.length} bytes)` }));
-            return;
-          }
-
-          // Create WAV strict 16kHz mono
-          const wavBuf = pcm16leToWavBuffer(pcmBuf, 16000, 1);
-
-          // STT
-          const sttText = await sttWhisper(wavBuf);
-          log('[STT] text=', sttText?.slice(0, 120));
-
-          ws.send(JSON.stringify({
-            type: 'stt',
-            text: sttText || '',
-            sourceLang: session.mode === 'auto_bidi' ? undefined : session.from,
-          }));
-
-          if (!sttText || !sttText.trim()) {
-            ws.send(JSON.stringify({ type: 'ack', ok: true, note: 'empty_stt' }));
-            return;
-          }
-
-          // Translate
-          const fromLang = session.mode === 'auto_bidi' ? (session.langs?.[0] || 'fr') : session.from;
-          const toLang = session.mode === 'auto_bidi' ? (session.langs?.[1] || 'en') : session.to;
-
-          const translated = await translateText(sttText, fromLang, toLang);
-          log('[TR] text=', translated?.slice(0, 120));
-
-          ws.send(JSON.stringify({
-            type: 'translation',
-            text: translated || '',
-            sourceLang: fromLang,
-            targetLang: toLang,
-          }));
-
-          if (!translated || !translated.trim()) {
-            ws.send(JSON.stringify({ type: 'ack', ok: true, note: 'empty_translation' }));
-            return;
-          }
-
-          // TTS (natural voice)
-          const audioB64 = await ttsMp3Base64(translated, process.env.TTS_VOICE || 'alloy');
-          log('[TTS] bytes(b64)=', audioB64 ? audioB64.length : 0);
-
-          ws.send(JSON.stringify({
-            type: 'tts',
-            audio: audioB64 || '',
-            format: 'mp3',
-            text: translated,
-            targetLang: toLang,
-          }));
-
-          return;
-        }
-
-        // Unknown message
-        log('[WS] JSON unknown', msg.type);
-        ws.send(JSON.stringify({ type: 'error', message: `unknown type: ${msg.type}` }));
         return;
       }
 
-      // ---------------- BINARY AUDIO ----------------
-      if (!session.started) return;
+      const text = typeof data === "string" ? data : Buffer.from(data).toString("utf8");
+      const msg = safeJsonParse(text);
 
-      const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-
-      // Align 2 bytes
-      const aligned = (buf.length % 2 === 0) ? buf : buf.subarray(0, buf.length - 1);
-      if (aligned.length <= 0) return;
-
-      session.pcmChunks.push(aligned);
-      session.pcmBytes += aligned.length;
-
-      // Optional: if client never flushes, prevent unbounded growth
-      if (session.pcmBytes > MAX_PCM_BYTES_PER_FLUSH) {
-        log('[WS] PCM too large, auto-flush drop', { bytes: session.pcmBytes });
-        session.pcmChunks = [];
-        session.pcmBytes = 0;
-        ws.send(JSON.stringify({ type: 'error', message: 'PCM buffer overflow, dropped' }));
+      if (!msg || !msg.type) {
+        warn(`[WS] id=${id} Non-JSON message ignored:`, text.slice(0, 120));
+        return;
       }
-    } catch (err) {
-      log('[WS] handler error', err?.message || err);
-      try {
-        ws.send(JSON.stringify({ type: 'error', message: err?.message || String(err) }));
-      } catch {}
+
+      if (msg.type === "start") {
+        started = true;
+        mode = msg.mode || "mono";
+        fromLang = (msg.from || "fr").toString();
+        toLang = (msg.to || "en").toString();
+
+        // Fix DeepL deprecated codes early
+        fromLang = mapDeepLLang(fromLang);
+        toLang = mapDeepLLang(toLang);
+
+        resetBuffer();
+
+        log(`[START] id=${id} mode=${mode} from=${fromLang} to=${toLang} sr=${msg.sampleRate} ch=${msg.channels}`);
+        sendJson({ type: "ack", ok: true, id, wsPath: "/ws" });
+        return;
+      }
+
+      if (msg.type === "stop") {
+        log(`[STOP] id=${id}`);
+        resetBuffer();
+        sendJson({ type: "stopped" });
+        return;
+      }
+
+      if (msg.type === "flush") {
+        if (!started) {
+          warn(`[FLUSH] id=${id} received before start`);
+          sendJson({ type: "error", message: "flush before start" });
+          return;
+        }
+
+        const pcm = Buffer.concat(pcmChunks);
+        const pcmAligned = ensureEvenBytes(pcm);
+
+        const durationMs = Math.round((pcmAligned.length / 2 / SAMPLE_RATE) * 1000);
+        log(`[FLUSH] id=${id} pcmBytes=${pcmAligned.length} durationMs≈${durationMs}`);
+
+        if (pcmAligned.length < 3200) { // <100ms
+          warn(`[FLUSH] id=${id} too short, skipping`);
+          resetBuffer();
+          sendJson({ type: "stt", text: "" });
+          return;
+        }
+
+        // Build WAV
+        const wav = bufferToWavPCM16Mono(pcmAligned, SAMPLE_RATE);
+        log(`[WAV] id=${id} wavBytes=${wav.length}`);
+
+        // Reset buffer BEFORE processing to keep stream moving
+        resetBuffer();
+
+        // STT
+        log(`[STT] id=${id} start model=${OPENAI_STT_MODEL}`);
+        const sttText = await openaiTranscribeWav(wav, ""); // keep auto
+        log(`[STT] id=${id} text="${sttText.slice(0, 120)}"`);
+
+        sendJson({ type: "stt", text: sttText, sourceLang: fromLang });
+
+        if (!sttText.trim()) {
+          log(`[TRANSLATE] id=${id} empty stt → skip`);
+          return;
+        }
+
+        // Translate
+        let translated = "";
+        try {
+          if (DEEPL_API_KEY) {
+            translated = await deeplTranslate(sttText, toLang, fromLang);
+            log(`[DEEPL] id=${id} ok len=${translated.length}`);
+          } else {
+            translated = await openaiTranslate(sttText, fromLang, toLang);
+            log(`[OAI-TR] id=${id} ok len=${translated.length}`);
+          }
+        } catch (e) {
+          errLog(`[TRANSLATE] id=${id} failed`, e?.message || e);
+          sendJson({ type: "error", message: `translate failed: ${e?.message || e}` });
+          return;
+        }
+
+        sendJson({ type: "translation", text: translated, targetLang: toLang, sourceLang: fromLang });
+
+        // TTS
+        try {
+          log(`[TTS] id=${id} start model=${OPENAI_TTS_MODEL}`);
+          const mp3 = await openaiTtsMp3(translated, process.env.OPENAI_TTS_VOICE || "alloy");
+          const b64 = mp3.toString("base64");
+          log(`[TTS] id=${id} mp3Bytes=${mp3.length} b64Len=${b64.length}`);
+          sendJson({ type: "tts", audio: b64, format: "mp3" });
+        } catch (e) {
+          errLog(`[TTS] id=${id} failed`, e?.message || e);
+          sendJson({ type: "error", message: `tts failed: ${e?.message || e}` });
+        }
+
+        return;
+      }
+
+      warn(`[WS] id=${id} Unknown msg.type=${msg.type}`);
+    } catch (e) {
+      errLog(`[WS] id=${id} handler crash`, e?.message || e);
+      sendJson({ type: "error", message: `server exception: ${e?.message || e}` });
     }
   });
 });
 
-// -------------------- START --------------------
 server.listen(PORT, () => {
   log(`HTTP listening on :${PORT}`);
-  log(`Health: /health`);
-  log(`WebSocket: ${WS_PATH}`);
+  log(`WS path: /ws`);
 });
