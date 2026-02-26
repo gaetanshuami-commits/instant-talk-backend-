@@ -1,16 +1,29 @@
 /**
- * server.js — Instant Talk Backend (Railway) — v2.0.1
+ * server.js — Instant Talk Backend (Railway) — STABLE v2.1
  *
- * WS: /ws
- * Audio in: PCM Int16 LE mono 16kHz (binary frames)
- * Control in: JSON: config / flush / reset
+ * HTTP:
+ *  - GET /        -> info
+ *  - GET /healthz -> ok
  *
- * Output (always):
- *   {type:"stt"} {type:"translation"} {type:"tts"} OR {type:"error"}
+ * WS:
+ *  - /ws
  *
- * v2.0.1 FIX:
- * - Fix crash: LANG_NAME_TO_CODE keys with spaces must be quoted (e.g., "tiếng việt", "bahasa indonesia")
- * - Ensure only normal quotes are used in source
+ * Audio IN:
+ *  - PCM Int16 LE mono 16kHz (binary frames)
+ *
+ * Control IN (JSON):
+ *  - {type:"config", sourceLang, targetLang, auto_bidi, voice}
+ *  - {type:"flush"}
+ *  - {type:"reset"}
+ *
+ * Output (always JSON):
+ *  - {type:"stt"} {type:"translation"} {type:"tts"} OR {type:"error"}
+ *
+ * Fixes:
+ *  - Removes duplicate identifier crash (server/serveur already declared)
+ *  - Uses httpServer naming + single HTTP server instance
+ *  - Keeps DeepL endpoint auto-switch (free/pro)
+ *  - Uses Railway env models (OPENAI_STT_MODEL / OPENAI_TTS_MODEL)
  */
 
 import http from "http";
@@ -64,359 +77,44 @@ const MAX_PCM_BYTES_PER_UTTERANCE = Number(process.env.MAX_PCM_BYTES_PER_UTTERAN
 const MAX_TEXT_CHARS = Number(process.env.MAX_TEXT_CHARS || 2000);
 const WS_PING_INTERVAL_MS = Number(process.env.WS_PING_INTERVAL_MS || 15000);
 
-// Guards quality (tweakable via Railway vars)
+// Guards
 const MIN_AUDIO_MS_FOR_STT = Number(process.env.MIN_AUDIO_MS_FOR_STT || 500);
 const MIN_RMS = Number(process.env.MIN_RMS || 0.007);
 const MAX_CLIP_RATE = Number(process.env.MAX_CLIP_RATE || 0.08);
-const MAX_NO_SPEECH_PROB = Number(process.env.MAX_NO_SPEECH_PROB || 0.55);
-const MIN_AVG_LOGPROB = Number(process.env.MIN_AVG_LOGPROB || -1.10);
-const MAX_COMPRESSION_RATIO = Number(process.env.MAX_COMPRESSION_RATIO || 2.4);
-
-// AGC
-const AGC_ENABLED = (process.env.AGC_ENABLED || "true").toLowerCase() === "true";
-const AGC_TARGET_RMS = Number(process.env.AGC_TARGET_RMS || 0.12);
-const AGC_MAX_GAIN = Number(process.env.AGC_MAX_GAIN || 8.0);
-
-// Hallucination filter
-const HALLUCINATION_MIN_WORDS = Number(process.env.HALLUCINATION_MIN_WORDS || 1);
-const HALLUCINATION_MAX_DURATION_FOR_SHORT = Number(process.env.HALLUCINATION_MAX_DURATION_FOR_SHORT || 1500);
 
 // Optional: keep wavs for debugging
 const KEEP_WAV_DEBUG = (process.env.KEEP_WAV_DEBUG || "false").toLowerCase() === "true";
 
 // -------------------------
-// WHISPER HALLUCINATION BLACKLIST
-// -------------------------
-const WHISPER_HALLUCINATION_BLACKLIST = new Set([
-  "you",
-  "thank you",
-  "thanks",
-  "thanks for watching",
-  "thank you for watching",
-  "thanks for listening",
-  "thank you for listening",
-  "bye",
-  "bye bye",
-  "goodbye",
-  "see you next time",
-  "see you",
-  "subtitles by",
-  "subtitles",
-  "sous-titres",
-  "sous-titrage",
-  "merci",
-  "merci d'avoir regardé",
-  "merci de regarder",
-  "au revoir",
-  "toi",
-  "moi",
-  "oui",
-  "non",
-  "ok",
-  "okay",
-  "oh",
-  "ah",
-  "hmm",
-  "um",
-  "uh",
-  "huh",
-  "boing boing",
-  "boing",
-  "ding",
-  "ding ding",
-  "beep",
-  "la la la",
-  "blah blah",
-  "i'm sorry",
-  "sorry",
-  "the end",
-  "the",
-  "a",
-  "yeah",
-  "yes",
-  "no",
-  "so",
-  "and",
-  "but",
-  "like",
-  "right",
-  "well",
-  "just",
-  "it",
-  "is",
-  "this",
-  "that",
-  "what",
-  "i",
-  "he",
-  "she",
-  "we",
-  "they",
-  "do",
-  "go",
-  "come",
-  "here",
-  "there",
-  "now",
-  "then",
-  "not",
-  "all",
-  "can",
-  "will",
-  "if",
-  "on",
-  "in",
-  "at",
-  "to",
-  "for",
-  "of",
-  "up",
-  "out",
-  "off",
-  "my",
-  "me",
-  "us",
-  "le",
-  "la",
-  "les",
-  "de",
-  "du",
-  "un",
-  "une",
-  "et",
-  "ou",
-  "je",
-  "tu",
-  "il",
-  "elle",
-  "on",
-  "nous",
-  "vous",
-  "ils",
-  "elles",
-  "ce",
-  "ça",
-  "que",
-  "qui",
-  "si",
-  "ne",
-  "pas",
-  "plus",
-  "est",
-  "sont",
-  "suis",
-  "dit",
-  "fait",
-]);
-
-function isLikelyHallucination(text, durationMs, sttQuality) {
-  const clean = text
-    .trim()
-    .toLowerCase()
-    .replace(/[.,!?;:…\-—–'"«»“”‘’()[\]{}]/g, "")
-    .trim();
-
-  if (WHISPER_HALLUCINATION_BLACKLIST.has(clean) && durationMs < 2000) {
-    return { rejected: true, reason: "blacklist_exact", cleaned: clean };
-  }
-
-  if (WHISPER_HALLUCINATION_BLACKLIST.has(clean)) {
-    const badQuality =
-      (sttQuality.avgNoSpeech !== null && sttQuality.avgNoSpeech > 0.35) ||
-      (sttQuality.avgLogprob !== null && sttQuality.avgLogprob < -0.80);
-    if (badQuality) {
-      return { rejected: true, reason: "blacklist_bad_quality", cleaned: clean };
-    }
-  }
-
-  const words = clean.split(/\s+/).filter(Boolean);
-  if (words.length <= HALLUCINATION_MIN_WORDS && durationMs > HALLUCINATION_MAX_DURATION_FOR_SHORT) {
-    return { rejected: true, reason: "too_few_words_for_duration", wordCount: words.length, cleaned: clean };
-  }
-
-  if (words.length >= 4) {
-    const half = Math.floor(words.length / 2);
-    const first = words.slice(0, half).join(" ");
-    const second = words.slice(half, half * 2).join(" ");
-    if (first === second && first.length > 2) {
-      return { rejected: true, reason: "repeated_phrase", cleaned: clean };
-    }
-  }
-
-  return { rejected: false };
-}
-
-// -------------------------
-// LANGUAGE NORMALIZATION (backend-side safety net)
-// FIX: quote ALL keys to avoid syntax errors (spaces/diacritics)
+// Language normalization (simple, safe)
 // -------------------------
 const LANG_NAME_TO_CODE = {
-  "français": "fr",
-  "french": "fr",
-  "francais": "fr",
-
-  "english": "en",
-  "anglais": "en",
-
-  "español": "es",
-  "espagnol": "es",
-  "spanish": "es",
-
-  "deutsch": "de",
-  "allemand": "de",
-  "german": "de",
-
-  "italiano": "it",
-  "italien": "it",
-  "italian": "it",
-
-  "português": "pt",
-  "portugais": "pt",
-  "portuguese": "pt",
-  "portugues": "pt",
-
-  "中文": "zh",
-  "chinois": "zh",
-  "chinese": "zh",
-  "mandarin": "zh",
-
-  "العربية": "ar",
-  "arabe": "ar",
-  "arabic": "ar",
-
-  "日本語": "ja",
-  "japonais": "ja",
-  "japanese": "ja",
-
-  "한국어": "ko",
-  "coréen": "ko",
-  "korean": "ko",
-  "coreen": "ko",
-
-  "русский": "ru",
-  "russe": "ru",
-  "russian": "ru",
-
-  "हिन्दी": "hi",
-  "hindi": "hi",
-
-  "türkçe": "tr",
-  "turc": "tr",
-  "turkish": "tr",
-  "turkce": "tr",
-
-  "polski": "pl",
-  "polonais": "pl",
-  "polish": "pl",
-
-  "nederlands": "nl",
-  "néerlandais": "nl",
-  "neerlandais": "nl",
-  "dutch": "nl",
-
-  "svenska": "sv",
-  "suédois": "sv",
-  "suedois": "sv",
-  "swedish": "sv",
-
-  "dansk": "da",
-  "danois": "da",
-  "danish": "da",
-
-  "suomi": "fi",
-  "finnois": "fi",
-  "finnish": "fi",
-
-  "norsk": "no",
-  "norvégien": "no",
-  "norvegien": "no",
-  "norwegian": "no",
-
-  "čeština": "cs",
-  "tchèque": "cs",
-  "tcheque": "cs",
-  "czech": "cs",
-
-  "română": "ro",
-  "roumain": "ro",
-  "romanian": "ro",
-
-  "magyar": "hu",
-  "hongrois": "hu",
-  "hungarian": "hu",
-
-  "ελληνικά": "el",
-  "grec": "el",
-  "greek": "el",
-
-  "עברית": "he",
-  "hébreu": "he",
-  "hebreu": "he",
-  "hebrew": "he",
-
-  "ภาษาไทย": "th",
-  "thaï": "th",
-  "thai": "th",
-
-  "tiếng việt": "vi",
-  "vietnamien": "vi",
-  "vietnamese": "vi",
-
-  "bahasa indonesia": "id",
-  "indonésien": "id",
-  "indonesien": "id",
-  "indonesian": "id",
-
-  "bahasa melayu": "ms",
-  "malais": "ms",
-  "malay": "ms",
-
-  "українська": "uk",
-  "ukrainien": "uk",
-  "ukrainian": "uk",
-
-  "català": "ca",
-  "catalan": "ca",
-
-  "galego": "gl",
-  "galicien": "gl",
-  "galician": "gl",
-
-  "euskara": "eu",
-  "basque": "eu",
-
-  "slovenčina": "sk",
-  "slovaque": "sk",
-  "slovak": "sk",
-
-  "slovenščina": "sl",
-  "slovène": "sl",
-  "slovene": "sl",
-  "slovenian": "sl",
-
-  "lietuvių": "lt",
-  "lituanien": "lt",
-  "lithuanian": "lt",
-
-  "latviešu": "lv",
-  "letton": "lv",
-  "latvian": "lv",
-
-  "eesti": "et",
-  "estonien": "et",
-  "estonian": "et",
-
-  "български": "bg",
-  "bulgare": "bg",
-  "bulgarian": "bg",
-
-  "hrvatski": "hr",
-  "croate": "hr",
-  "croatian": "hr",
-
-  "srpski": "sr",
-  "serbe": "sr",
-  "serbian": "sr",
+  français: "fr",
+  francais: "fr",
+  french: "fr",
+  english: "en",
+  anglais: "en",
+  spanish: "es",
+  espagnol: "es",
+  español: "es",
+  german: "de",
+  allemand: "de",
+  deutsch: "de",
+  italian: "it",
+  italien: "it",
+  italiano: "it",
+  portuguese: "pt",
+  portugais: "pt",
+  português: "pt",
+  chines: "zh",
+  chinois: "zh",
+  chinese: "zh",
+  العربية: "ar",
+  arabe: "ar",
+  arabic: "ar",
+  日本語: "ja",
+  japonais: "ja",
+  japanese: "ja",
 };
 
 function normalizeLangCode(lang) {
@@ -426,7 +124,9 @@ function normalizeLangCode(lang) {
 
   if (/^[a-z]{2,3}$/i.test(trimmed)) return trimmed.toLowerCase();
 
-  if (/^[a-z]{2,3}[-_][a-z]{2,4}$/i.test(trimmed)) return trimmed.split(/[-_]/)[0].toLowerCase();
+  if (/^[a-z]{2,3}[-_][a-z]{2,4}$/i.test(trimmed)) {
+    return trimmed.split(/[-_]/)[0].toLowerCase();
+  }
 
   const lower = trimmed.toLowerCase();
   if (LANG_NAME_TO_CODE[lower]) return LANG_NAME_TO_CODE[lower];
@@ -445,8 +145,28 @@ function whisperLanguageHint(rawLang) {
   return undefined;
 }
 
+function mapDeepLTargetLang(lang) {
+  const code = normalizeLangCode(lang);
+  if (!code) return lang;
+  if (code === "en") return "en-US";
+  if (code === "pt") return "pt-PT";
+  if (code === "zh") return "zh-Hans";
+  return code.toUpperCase();
+}
+
+function mapDeepLSourceLang(lang) {
+  const code = normalizeLangCode(lang);
+  if (!code) return undefined;
+  return code.toUpperCase();
+}
+
+function isDeepLWrongEndpointMessage(rawText) {
+  const t = String(rawText || "");
+  return t.includes("Wrong endpoint") || t.toLowerCase().includes("wrong endpoint");
+}
+
 // -------------------------
-// OpenAI
+// OpenAI client
 // -------------------------
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
@@ -460,7 +180,6 @@ app.get("/", (_req, res) => {
   res.status(200).json({
     ok: true,
     service: "instant-talk-backend",
-    version: "2.0.1",
     wsPath: WS_PATH,
     models: {
       stt: OPENAI_STT_MODEL,
@@ -477,12 +196,6 @@ app.get("/", (_req, res) => {
         MIN_AUDIO_MS_FOR_STT,
         MIN_RMS,
         MAX_CLIP_RATE,
-        MAX_NO_SPEECH_PROB,
-        MIN_AVG_LOGPROB,
-        MAX_COMPRESSION_RATIO,
-        AGC_ENABLED,
-        AGC_TARGET_RMS,
-        AGC_MAX_GAIN,
       },
       KEEP_WAV_DEBUG,
     },
@@ -492,12 +205,12 @@ app.get("/", (_req, res) => {
 app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
 // -------------------------
-// HTTP + WS
+// HTTP + WS (IMPORTANT: single instance -> httpServer)
 // -------------------------
-const server = http.createServer(app);
+const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-server.on("upgrade", (req, socket, head) => {
+httpServer.on("upgrade", (req, socket, head) => {
   try {
     const url = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
     if (url.pathname !== WS_PATH) {
@@ -546,26 +259,6 @@ function sanitizeTextForTTS(text) {
   return t;
 }
 
-function mapDeepLTargetLang(lang) {
-  const code = normalizeLangCode(lang);
-  if (!code) return lang;
-  if (code === "en") return "en-US";
-  if (code === "pt") return "pt-PT";
-  if (code === "zh") return "zh-Hans";
-  return code.toUpperCase();
-}
-
-function mapDeepLSourceLang(lang) {
-  const code = normalizeLangCode(lang);
-  if (!code) return undefined;
-  return code.toUpperCase();
-}
-
-function isDeepLWrongEndpointMessage(rawText) {
-  const t = String(rawText || "");
-  return t.includes("Wrong endpoint") || t.includes("wrong endpoint");
-}
-
 function pcmBytesToDurationMs(pcmBytes) {
   const denom = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * BYTES_PER_SAMPLE;
   if (!denom) return 0;
@@ -594,26 +287,6 @@ function computePcmMetrics(pcmBuffer) {
   return { rms, peak, clipRate, sampleCount };
 }
 
-function applyAGC(pcmBuffer, currentRms) {
-  if (!AGC_ENABLED || currentRms <= 0) return { gain: 1.0, applied: false };
-
-  const desiredGain = AGC_TARGET_RMS / currentRms;
-  const gain = Math.min(desiredGain, AGC_MAX_GAIN);
-
-  if (gain > 0.8 && gain < 1.3) return { gain: 1.0, applied: false };
-
-  const sampleCount = Math.floor(pcmBuffer.length / 2);
-  for (let i = 0; i < sampleCount; i++) {
-    let v = pcmBuffer.readInt16LE(i * 2);
-    v = Math.round(v * gain);
-    if (v > 32767) v = 32767;
-    if (v < -32768) v = -32768;
-    pcmBuffer.writeInt16LE(v, i * 2);
-  }
-
-  return { gain: Math.round(gain * 100) / 100, applied: true };
-}
-
 function pcm16leToWavBuffer(pcmBuffer, sampleRate, channels, bitsPerSample) {
   const byteRate = (sampleRate * channels * bitsPerSample) / 8;
   const blockAlign = (channels * bitsPerSample) / 8;
@@ -639,8 +312,18 @@ function pcm16leToWavBuffer(pcmBuffer, sampleRate, channels, bitsPerSample) {
   return Buffer.concat([header, pcmBuffer]);
 }
 
+function cleanupWav(wavPath) {
+  if (!KEEP_WAV_DEBUG) {
+    try {
+      fs.unlinkSync(wavPath);
+    } catch {}
+  } else {
+    console.log(`[WAV_DEBUG] kept wav at ${wavPath}`);
+  }
+}
+
 // -------------------------
-// DeepL translate
+// DeepL translate (with endpoint retry)
 // -------------------------
 async function deeplTranslate({ text, sourceLang, targetLang }) {
   const mappedTarget = mapDeepLTargetLang(targetLang);
@@ -712,12 +395,9 @@ async function openaiTranslate({ text, sourceLang, targetLang }) {
   const srcName = sourceLang || "auto-detect";
   const tgtName = targetLang;
 
-  const system = [
-    "You are a translation engine for real-time voice conversation.",
-    "Translate the user's spoken text naturally and accurately.",
-    "Return ONLY the translated text. No quotes, no explanations, no extra lines.",
-    "Preserve the speaker's tone and intent. Keep it conversational.",
-  ].join(" ");
+  const system =
+    "You are a translation engine for real-time voice conversation. " +
+    "Translate naturally and accurately. Return ONLY the translated text (no quotes, no explanations).";
 
   const user = `Translate from ${srcName} to ${tgtName}:\n\n${text}`;
 
@@ -738,11 +418,10 @@ async function openaiTranslate({ text, sourceLang, targetLang }) {
 }
 
 // -------------------------
-// OpenAI STT (verbose_json)
+// OpenAI STT
 // -------------------------
-async function openaiTranscribeWavFileVerbose({ wavPath, languageHint }) {
+async function openaiTranscribeVerbose({ wavPath, languageHint }) {
   const t0 = nowMs();
-
   const file = fs.createReadStream(wavPath);
 
   const params = {
@@ -755,54 +434,13 @@ async function openaiTranscribeWavFileVerbose({ wavPath, languageHint }) {
   if (hint) params.language = hint;
 
   const result = await openai.audio.transcriptions.create(params);
-
   const ms = nowMs() - t0;
 
-  const text = (result?.text || "").trim();
-  const language = result?.language || "";
-  const segments = Array.isArray(result?.segments) ? result.segments : [];
-
-  let avgNoSpeech = null;
-  let avgLogprob = null;
-  let avgCompressionRatio = null;
-
-  if (segments.length > 0) {
-    let sumNoSpeech = 0;
-    let sumLogprob = 0;
-    let sumCompRatio = 0;
-    let countNoSpeech = 0;
-    let countLogprob = 0;
-    let countCompRatio = 0;
-
-    for (const s of segments) {
-      if (typeof s?.no_speech_prob === "number") {
-        sumNoSpeech += s.no_speech_prob;
-        countNoSpeech++;
-      }
-      if (typeof s?.avg_logprob === "number") {
-        sumLogprob += s.avg_logprob;
-        countLogprob++;
-      }
-      if (typeof s?.compression_ratio === "number") {
-        sumCompRatio += s.compression_ratio;
-        countCompRatio++;
-      }
-    }
-
-    avgNoSpeech = countNoSpeech ? sumNoSpeech / countNoSpeech : null;
-    avgLogprob = countLogprob ? sumLogprob / countLogprob : null;
-    avgCompressionRatio = countCompRatio ? sumCompRatio / countCompRatio : null;
-  }
-
   return {
-    text,
+    text: (result?.text || "").trim(),
     ms,
     model: OPENAI_STT_MODEL,
-    language,
-    segmentsCount: segments.length,
-    avgNoSpeech,
-    avgLogprob,
-    avgCompressionRatio,
+    language: result?.language || "",
   };
 }
 
@@ -817,12 +455,10 @@ async function openaiTtsMp3({ text, voice }) {
     voice: voice || OPENAI_TTS_VOICE,
     input: text,
     response_format: "mp3",
-    speed: 1.05,
   });
 
   const buffer = Buffer.from(await mp3.arrayBuffer());
   const ms = nowMs() - t0;
-
   return { buffer, ms, model: OPENAI_TTS_MODEL };
 }
 
@@ -847,8 +483,6 @@ function makeConnectionState() {
     isProcessing: false,
     pendingFlush: false,
     seq: 0,
-    lastSttText: "",
-    lastSttTime: 0,
   };
 }
 
@@ -865,22 +499,6 @@ function appendPcm(state, buf) {
 // -------------------------
 // WS
 // -------------------------
-const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
-
-server.on("upgrade", (req, socket, head) => {
-  try {
-    const url = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
-    if (url.pathname !== WS_PATH) {
-      socket.destroy();
-      return;
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } catch {
-    socket.destroy();
-  }
-});
-
 wss.on("connection", (ws, req) => {
   const state = makeConnectionState();
 
@@ -894,13 +512,17 @@ wss.on("connection", (ws, req) => {
   sendJson(ws, {
     type: "ready",
     id: state.id,
-    version: "2.0.1",
     wsPath: WS_PATH,
-    models: { stt: OPENAI_STT_MODEL, tts: OPENAI_TTS_MODEL, translation: OPENAI_TRANSLATION_MODEL },
+    models: {
+      stt: OPENAI_STT_MODEL,
+      tts: OPENAI_TTS_MODEL,
+      translation: OPENAI_TRANSLATION_MODEL,
+    },
     voice: state.config.voice,
     deepl: { enabled: Boolean(DEEPL_API_KEY), endpoint: DEEPL_API_URL_PRIMARY || null },
   });
 
+  // keepalive
   ws.isAlive = true;
   ws.on("pong", () => (ws.isAlive = true));
 
@@ -929,8 +551,7 @@ wss.on("connection", (ws, req) => {
   ws.on("message", async (data, isBinary) => {
     if (isBinary) {
       const buf = Buffer.from(data);
-      if (buf.length % 2 !== 0) appendPcm(state, buf.slice(0, buf.length - 1));
-      else appendPcm(state, buf);
+      appendPcm(state, buf.length % 2 === 0 ? buf : buf.slice(0, buf.length - 1));
 
       if (state.pcmBytes > MAX_PCM_BYTES_PER_UTTERANCE) {
         console.error(`[AUDIO][${state.id}] overflow pcmBytes=${state.pcmBytes} max=${MAX_PCM_BYTES_PER_UTTERANCE}`);
@@ -945,8 +566,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    const str = data.toString("utf8");
-    const msg = safeJsonParse(str);
+    const msg = safeJsonParse(data.toString("utf8"));
     if (!msg || typeof msg !== "object") return;
 
     const type = String(msg.type || "").trim();
@@ -960,6 +580,7 @@ wss.on("connection", (ws, req) => {
       if (typeof msg.voice === "string" && msg.voice.trim()) next.voice = msg.voice.trim();
 
       state.config = next;
+
       console.log(`[CFG][${state.id}] sourceLang=${next.sourceLang || "auto"} targetLang=${next.targetLang} voice=${next.voice}`);
       sendJson(ws, { type: "config_ack", config: next });
       return;
@@ -968,8 +589,6 @@ wss.on("connection", (ws, req) => {
     if (type === "reset") {
       resetAudioBuffer(state);
       state.pendingFlush = false;
-      state.lastSttText = "";
-      state.lastSttTime = 0;
       console.log(`[AUDIO][${state.id}] reset`);
       sendJson(ws, { type: "reset_ack" });
       return;
@@ -999,21 +618,19 @@ async function processUtterance(ws, state, flushMsg) {
 
   const durationMs = pcmBytesToDurationMs(state.pcmBytes);
   const pcm = state.pcmBytes > 0 ? Buffer.concat(state.pcmChunks, state.pcmBytes) : Buffer.alloc(0);
-  const metricsRaw = computePcmMetrics(pcm);
+  const metrics = computePcmMetrics(pcm);
 
   console.log(
-    `[AUDIO][${state.id}][#${seq}] pcmBytes=${state.pcmBytes} durationMs=${durationMs} rms=${metricsRaw.rms.toFixed(
-      4
-    )} peak=${metricsRaw.peak.toFixed(4)} clipRate=${metricsRaw.clipRate.toFixed(4)}`
+    `[AUDIO][${state.id}][#${seq}] pcmBytes=${state.pcmBytes} durationMs=${durationMs} rms=${metrics.rms.toFixed(4)} peak=${metrics.peak.toFixed(4)} clipRate=${metrics.clipRate.toFixed(4)}`
   );
 
   const meta = {
     seq,
     pcmBytes: state.pcmBytes,
     durationMs,
-    rms: metricsRaw.rms,
-    peak: metricsRaw.peak,
-    clipRate: metricsRaw.clipRate,
+    rms: metrics.rms,
+    peak: metrics.peak,
+    clipRate: metrics.clipRate,
     sourceLang: state.config.sourceLang || "auto",
     targetLang: state.config.targetLang || "en",
     voice: state.config.voice || OPENAI_TTS_VOICE,
@@ -1036,92 +653,41 @@ async function processUtterance(ws, state, flushMsg) {
       return;
     }
 
-    if (metricsRaw.rms < MIN_RMS) {
+    if (metrics.rms < MIN_RMS) {
       resetAudioBuffer(state);
       sendJson(ws, {
         type: "error",
         stage: "stt",
-        message: `Audio too quiet (rms=${metricsRaw.rms.toFixed(4)}).`,
+        message: `Audio too quiet (rms=${metrics.rms.toFixed(4)}).`,
         details: { ...meta, code: "too_quiet", minRms: MIN_RMS },
       });
       return;
     }
 
-    if (metricsRaw.clipRate > MAX_CLIP_RATE) {
+    if (metrics.clipRate > MAX_CLIP_RATE) {
       resetAudioBuffer(state);
       sendJson(ws, {
         type: "error",
         stage: "stt",
-        message: `Audio clipped (clipRate=${metricsRaw.clipRate.toFixed(4)}).`,
+        message: `Audio clipped (clipRate=${metrics.clipRate.toFixed(4)}).`,
         details: { ...meta, code: "clipped", maxClipRate: MAX_CLIP_RATE },
       });
       return;
     }
 
+    // Freeze and reset buffer (important: do it once)
     resetAudioBuffer(state);
 
-    const agcResult = applyAGC(pcm, metricsRaw.rms);
-    if (agcResult.applied) {
-      const metricsPost = computePcmMetrics(pcm);
-      console.log(
-        `[AGC][${state.id}][#${seq}] gain=${agcResult.gain}x rmsAfter=${metricsPost.rms.toFixed(4)} peakAfter=${metricsPost.peak.toFixed(4)}`
-      );
-    }
-
-    console.log(
-      `[PIPE][${state.id}][#${seq}] start durationMs=${durationMs} src=${meta.sourceLang} tgt=${meta.targetLang} langHint=${whisperLanguageHint(state.config.sourceLang) || "auto"}`
-    );
-
+    // WAV
     const wav = pcm16leToWavBuffer(pcm, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS_PER_SAMPLE);
     const wavPath = path.join(os.tmpdir(), `utt_${state.id}_${seq}_${Date.now()}.wav`);
     fs.writeFileSync(wavPath, wav);
 
-    const stt = await openaiTranscribeWavFileVerbose({
-      wavPath,
-      languageHint: state.config.sourceLang || undefined,
-    });
-
-    console.log(
-      `[STT][${state.id}][#${seq}] model=${stt.model} ms=${stt.ms} lang=${stt.language || "-"} segments=${stt.segmentsCount} text="${truncate(stt.text, 240)}"`
-    );
-
-    console.log(
-      `[STT_QUAL][${state.id}][#${seq}] noSpeech=${stt.avgNoSpeech === null ? "null" : stt.avgNoSpeech.toFixed(3)} logprob=${
-        stt.avgLogprob === null ? "null" : stt.avgLogprob.toFixed(3)
-      } compRatio=${stt.avgCompressionRatio === null ? "null" : stt.avgCompressionRatio.toFixed(3)}`
-    );
-
+    // STT
+    const stt = await openaiTranscribeVerbose({ wavPath, languageHint: state.config.sourceLang || undefined });
     cleanupWav(wavPath);
 
-    if (typeof stt.avgNoSpeech === "number" && stt.avgNoSpeech > MAX_NO_SPEECH_PROB) {
-      sendJson(ws, {
-        type: "error",
-        stage: "stt",
-        message: `No speech detected (no_speech_prob=${stt.avgNoSpeech.toFixed(3)}).`,
-        details: { ...meta, code: "no_speech", avgNoSpeech: stt.avgNoSpeech, maxNoSpeech: MAX_NO_SPEECH_PROB, detectedLang: stt.language },
-      });
-      return;
-    }
-
-    if (typeof stt.avgLogprob === "number" && stt.avgLogprob < MIN_AVG_LOGPROB) {
-      sendJson(ws, {
-        type: "error",
-        stage: "stt",
-        message: `Low STT confidence (avg_logprob=${stt.avgLogprob.toFixed(3)}).`,
-        details: { ...meta, code: "low_conf", avgLogprob: stt.avgLogprob, minAvgLogprob: MIN_AVG_LOGPROB, detectedLang: stt.language },
-      });
-      return;
-    }
-
-    if (typeof stt.avgCompressionRatio === "number" && stt.avgCompressionRatio > MAX_COMPRESSION_RATIO) {
-      sendJson(ws, {
-        type: "error",
-        stage: "stt",
-        message: `Suspicious STT output (compression_ratio=${stt.avgCompressionRatio.toFixed(3)}).`,
-        details: { ...meta, code: "high_compression", avgCompressionRatio: stt.avgCompressionRatio, maxCompressionRatio: MAX_COMPRESSION_RATIO, detectedLang: stt.language },
-      });
-      return;
-    }
+    console.log(`[STT][${state.id}][#${seq}] model=${stt.model} ms=${stt.ms} lang=${stt.language || "-"} text="${truncate(stt.text, 240)}"`);
 
     const sttText = (stt.text || "").trim();
     if (!sttText) {
@@ -1129,94 +695,59 @@ async function processUtterance(ws, state, flushMsg) {
       return;
     }
 
-    const halluCheck = isLikelyHallucination(sttText, durationMs, {
-      avgNoSpeech: stt.avgNoSpeech,
-      avgLogprob: stt.avgLogprob,
-    });
-    if (halluCheck.rejected) {
-      console.warn(
-        `[HALLU][${state.id}][#${seq}] REJECTED text="${truncate(sttText, 120)}" reason=${halluCheck.reason} cleaned="${halluCheck.cleaned || ""}" durationMs=${durationMs}`
-      );
-      sendJson(ws, {
-        type: "error",
-        stage: "stt",
-        message: `Likely hallucination rejected: "${truncate(sttText, 60)}"`,
-        details: { ...meta, code: "hallucination", reason: halluCheck.reason, originalText: sttText, detectedLang: stt.language },
-      });
-      return;
-    }
+    sendJson(ws, { type: "stt", text: sttText, model: stt.model, ms: stt.ms, seq, detectedLang: stt.language || null });
 
-    const timeSinceLast = nowMs() - state.lastSttTime;
-    if (sttText === state.lastSttText && timeSinceLast < 3000 && sttText.split(/\s+/).length <= 3) {
-      console.warn(`[REPEAT][${state.id}][#${seq}] text="${truncate(sttText, 80)}" timeSinceLast=${timeSinceLast}ms`);
-      sendJson(ws, {
-        type: "error",
-        stage: "stt",
-        message: `Repeated output suppressed: "${truncate(sttText, 60)}"`,
-        details: { ...meta, code: "repeat", timeSinceLast },
-      });
-      return;
-    }
-
-    state.lastSttText = sttText;
-    state.lastSttTime = nowMs();
-
-    sendJson(ws, {
-      type: "stt",
-      text: sttText,
-      model: stt.model,
-      ms: stt.ms,
-      seq,
-      detectedLang: stt.language || null,
-      sttQuality: {
-        avgNoSpeech: stt.avgNoSpeech,
-        avgLogprob: stt.avgLogprob,
-        avgCompressionRatio: stt.avgCompressionRatio,
-        segmentsCount: stt.segmentsCount,
-      },
-      audio: { durationMs, rms: metricsRaw.rms, peak: metricsRaw.peak, clipRate: metricsRaw.clipRate, agcGain: agcResult.gain },
-    });
-
-    const src = (state.config.sourceLang || "").trim();
-    const tgt = (state.config.targetLang || "").trim() || "en";
+    // Translation
+    const srcNorm = normalizeLangCode(state.config.sourceLang);
+    const tgtNorm = normalizeLangCode(state.config.targetLang) || "en";
 
     let translatedText = sttText;
     let provider = "none";
     let translationMs = 0;
 
-    const srcNorm = normalizeLangCode(src);
-    const tgtNorm = normalizeLangCode(tgt);
-
     if (srcNorm && tgtNorm && srcNorm === tgtNorm) {
-      console.log(`[TRANSL][${state.id}][#${seq}] SKIP (same lang: ${srcNorm})`);
+      console.log(`[TRANSL][${state.id}][#${seq}] SKIP (same lang ${srcNorm})`);
     } else {
       const t0 = nowMs();
+
       if (DEEPL_API_KEY) {
         try {
-          const r = await deeplTranslate({ text: sttText, sourceLang: srcNorm || undefined, targetLang: tgt });
+          const r = await deeplTranslate({
+            text: sttText,
+            sourceLang: srcNorm || undefined,
+            targetLang: tgtNorm,
+          });
           translatedText = r.text;
           provider = "deepl";
           translationMs = nowMs() - t0;
-          console.log(`[TRANSL][${state.id}][#${seq}] provider=deepl ms=${translationMs} text="${truncate(translatedText, 240)}"`);
-        } catch (deeplErr) {
-          console.warn(`[TRANSL][${state.id}][#${seq}] DeepL failed -> fallback OpenAI err="${truncate(deeplErr?.message, 160)}"`);
-          const r = await openaiTranslate({ text: sttText, sourceLang: srcNorm || "auto", targetLang: tgt });
+        } catch (e) {
+          console.warn(`[TRANSL][${state.id}][#${seq}] DeepL failed -> fallback OpenAI: ${truncate(e?.message || "", 160)}`);
+          const r = await openaiTranslate({
+            text: sttText,
+            sourceLang: srcNorm || "auto",
+            targetLang: tgtNorm,
+          });
           translatedText = r.text;
           provider = "openai_fallback";
           translationMs = nowMs() - t0;
-          console.log(`[TRANSL][${state.id}][#${seq}] provider=openai_fallback ms=${translationMs} text="${truncate(translatedText, 240)}"`);
         }
       } else {
-        const r = await openaiTranslate({ text: sttText, sourceLang: srcNorm || "auto", targetLang: tgt });
+        const r = await openaiTranslate({
+          text: sttText,
+          sourceLang: srcNorm || "auto",
+          targetLang: tgtNorm,
+        });
         translatedText = r.text;
         provider = "openai";
         translationMs = nowMs() - t0;
-        console.log(`[TRANSL][${state.id}][#${seq}] provider=openai ms=${translationMs} text="${truncate(translatedText, 240)}"`);
       }
+
+      console.log(`[TRANSL][${state.id}][#${seq}] provider=${provider} ms=${translationMs} text="${truncate(translatedText, 240)}"`);
     }
 
-    sendJson(ws, { type: "translation", text: translatedText, provider, sourceLang: srcNorm || "auto", targetLang: tgtNorm || tgt, ms: translationMs, seq });
+    sendJson(ws, { type: "translation", text: translatedText, provider, sourceLang: srcNorm || "auto", targetLang: tgtNorm, ms: translationMs, seq });
 
+    // TTS
     const ttsInput = sanitizeTextForTTS(translatedText);
     if (!ttsInput) {
       sendJson(ws, { type: "error", stage: "tts", message: "TTS input empty after translation.", details: { ...meta, provider } });
@@ -1277,21 +808,11 @@ async function processUtterance(ws, state, flushMsg) {
   }
 }
 
-function cleanupWav(wavPath) {
-  if (!KEEP_WAV_DEBUG) {
-    try {
-      fs.unlinkSync(wavPath);
-    } catch {}
-  } else {
-    console.log(`[WAV_DEBUG] kept wav at ${wavPath}`);
-  }
-}
-
 // -------------------------
 // Start
 // -------------------------
-server.listen(PORT, () => {
-  console.log(`[BOOT] 🚀 Instant Talk Backend v2.0.1`);
+httpServer.listen(PORT, () => {
+  console.log(`[BOOT] 🚀 Instant Talk Backend STABLE v2.1`);
   console.log(`[BOOT] listening :${PORT}`);
   console.log(`[BOOT] WS path: ${WS_PATH}`);
   console.log(`[BOOT] OpenAI STT model: ${OPENAI_STT_MODEL}`);
@@ -1302,9 +823,5 @@ server.listen(PORT, () => {
     console.log(`[BOOT] DeepL endpoint(primary): ${DEEPL_API_URL_PRIMARY}`);
     console.log(`[BOOT] DeepL endpoint(alt): ${DEEPL_API_URL_ALT}`);
   }
-  console.log(`[BOOT] AGC: enabled=${AGC_ENABLED} targetRms=${AGC_TARGET_RMS} maxGain=${AGC_MAX_GAIN}`);
-  console.log(
-    `[BOOT] Guards: MIN_MS=${MIN_AUDIO_MS_FOR_STT} MIN_RMS=${MIN_RMS} MAX_CLIP=${MAX_CLIP_RATE} MAX_NO_SPEECH=${MAX_NO_SPEECH_PROB} MIN_LOGPROB=${MIN_AVG_LOGPROB} MAX_COMP_RATIO=${MAX_COMPRESSION_RATIO}`
-  );
-  console.log(`[BOOT] Hallucination blacklist: ${WHISPER_HALLUCINATION_BLACKLIST.size} entries`);
+  console.log(`[BOOT] Guards: MIN_MS=${MIN_AUDIO_MS_FOR_STT} MIN_RMS=${MIN_RMS} MAX_CLIP=${MAX_CLIP_RATE}`);
 });
