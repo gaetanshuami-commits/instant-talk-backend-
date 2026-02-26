@@ -1,42 +1,40 @@
 /**
  * server.js — Instant Talk Backend (Railway) — STABLE v2.1
  *
- * HTTP:
- *  - GET /        -> info
- *  - GET /healthz -> ok
+ * WS: /ws
+ * HTTP: /healthz + /
  *
- * WS:
- *  - /ws
+ * Audio IN (binary frames):
+ *  - PCM Int16 LE, mono, 16kHz
  *
- * Audio IN:
- *  - PCM Int16 LE mono 16kHz (binary frames)
- *
- * Control IN (JSON):
+ * Control IN (JSON text frames):
  *  - {type:"config", sourceLang, targetLang, auto_bidi, voice}
  *  - {type:"flush"}
  *  - {type:"reset"}
  *
  * Output (always JSON):
- *  - {type:"stt"} {type:"translation"} {type:"tts"} OR {type:"error"}
+ *  - {type:"ready"}
+ *  - {type:"config_ack"} / {type:"flush_ack"} / {type:"reset_ack"}
+ *  - {type:"stt"} {type:"translation"} {type:"tts"} {type:"done"}
+ *  - OR {type:"error"}
  *
- * Fixes:
- *  - Removes duplicate identifier crash (server/serveur already declared)
- *  - Uses httpServer naming + single HTTP server instance
- *  - Keeps DeepL endpoint auto-switch (free/pro)
- *  - Uses Railway env models (OPENAI_STT_MODEL / OPENAI_TTS_MODEL)
+ * Notes:
+ *  - Uses OpenAI: STT whisper-1, TTS tts-1, Translation gpt-4o-mini (fallback)
+ *  - DeepL optional via DEEPL_API_KEY with correct endpoint auto-select
+ *  - Prevents “silent hangs”: every flush returns either pipeline results or an error
  */
 
 import http from "http";
 import crypto from "crypto";
 import fs from "fs";
-import path from "path";
 import os from "os";
+import path from "path";
 import express from "express";
 import { WebSocketServer } from "ws";
 import OpenAI from "openai";
 
 // -------------------------
-// ENV
+// ENV / CONSTANTS
 // -------------------------
 const PORT = Number(process.env.PORT || 3000);
 const WS_PATH = "/ws";
@@ -53,18 +51,16 @@ const OPENAI_TRANSLATION_MODEL = (process.env.OPENAI_TRANSLATION_MODEL || "gpt-4
 const OPENAI_TTS_VOICE = (process.env.OPENAI_TTS_VOICE || "alloy").trim();
 
 const DEEPL_API_KEY = (process.env.DEEPL_API_KEY || "").trim();
-
-// DeepL endpoint selection
 const DEEPL_API_URL_PRIMARY = DEEPL_API_KEY
   ? DEEPL_API_KEY.endsWith(":fx")
     ? "https://api-free.deepl.com/v2/translate"
     : "https://api.deepl.com/v2/translate"
   : "";
-
-const DEEPL_API_URL_ALT =
-  DEEPL_API_URL_PRIMARY === "https://api.deepl.com/v2/translate"
-    ? "https://api-free.deepl.com/v2/translate"
-    : "https://api.deepl.com/v2/translate";
+const DEEPL_API_URL_ALT = DEEPL_API_URL_PRIMARY
+  ? DEEPL_API_URL_PRIMARY.includes("api-free")
+    ? "https://api.deepl.com/v2/translate"
+    : "https://api-free.deepl.com/v2/translate"
+  : "";
 
 // Audio strict
 const AUDIO_SAMPLE_RATE = 16000;
@@ -72,41 +68,185 @@ const AUDIO_CHANNELS = 1;
 const AUDIO_BITS_PER_SAMPLE = 16;
 const BYTES_PER_SAMPLE = AUDIO_BITS_PER_SAMPLE / 8; // 2
 
-// Limits
-const MAX_PCM_BYTES_PER_UTTERANCE = Number(process.env.MAX_PCM_BYTES_PER_UTTERANCE || 3_000_000);
-const MAX_TEXT_CHARS = Number(process.env.MAX_TEXT_CHARS || 2000);
+// WS keepalive
 const WS_PING_INTERVAL_MS = Number(process.env.WS_PING_INTERVAL_MS || 15000);
 
-// Guards
-const MIN_AUDIO_MS_FOR_STT = Number(process.env.MIN_AUDIO_MS_FOR_STT || 500);
-const MIN_RMS = Number(process.env.MIN_RMS || 0.007);
-const MAX_CLIP_RATE = Number(process.env.MAX_CLIP_RATE || 0.08);
+// Limits / guards
+const MAX_PCM_BYTES_PER_UTTERANCE = Number(process.env.MAX_PCM_BYTES_PER_UTTERANCE || 3_000_000);
+const MAX_TEXT_CHARS = Number(process.env.MAX_TEXT_CHARS || 2000);
 
-// Optional: keep wavs for debugging
+// Quality guards (keep reasonable defaults; adjust on Railway)
+const MIN_AUDIO_MS_FOR_STT = Number(process.env.MIN_AUDIO_MS_FOR_STT || 450);
+const MIN_RMS = Number(process.env.MIN_RMS || 0.006);
+
+// Optional WAV debug
 const KEEP_WAV_DEBUG = (process.env.KEEP_WAV_DEBUG || "false").toLowerCase() === "true";
 
 // -------------------------
-// Language normalization (simple, safe)
+// OpenAI client
+// -------------------------
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// -------------------------
+// Express
+// -------------------------
+const app = express();
+app.disable("x-powered-by");
+
+app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+
+app.get("/", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "instant-talk-backend",
+    wsPath: WS_PATH,
+    models: {
+      stt: OPENAI_STT_MODEL,
+      tts: OPENAI_TTS_MODEL,
+      translation: OPENAI_TRANSLATION_MODEL,
+    },
+    voice: OPENAI_TTS_VOICE,
+    deepl: {
+      enabled: Boolean(DEEPL_API_KEY),
+      primaryEndpoint: DEEPL_API_URL_PRIMARY || null,
+      altEndpoint: DEEPL_API_URL_ALT || null,
+    },
+    audio: {
+      sampleRate: AUDIO_SAMPLE_RATE,
+      channels: AUDIO_CHANNELS,
+      bits: AUDIO_BITS_PER_SAMPLE,
+      guards: { MIN_AUDIO_MS_FOR_STT, MIN_RMS },
+      KEEP_WAV_DEBUG,
+    },
+  });
+});
+
+// -------------------------
+// HTTP server + WS server (ONLY ONCE — no double declaration)
+// -------------------------
+const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const url = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
+    if (url.pathname !== WS_PATH) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  } catch {
+    socket.destroy();
+  }
+});
+
+// -------------------------
+// Helpers
+// -------------------------
+function nowMs() {
+  return Date.now();
+}
+
+function makeConnId() {
+  return crypto.randomBytes(8).toString("hex");
+}
+
+function safeJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch {
+    return null;
+  }
+}
+
+function truncate(s, max = 240) {
+  const str = String(s ?? "");
+  return str.length <= max ? str : str.slice(0, max) + "…";
+}
+
+function sendJson(ws, obj) {
+  if (ws.readyState !== ws.OPEN) return;
+  ws.send(JSON.stringify(obj));
+}
+
+function pcmBytesToDurationMs(pcmBytes) {
+  const denom = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * BYTES_PER_SAMPLE;
+  if (!denom) return 0;
+  return Math.round((pcmBytes / denom) * 1000);
+}
+
+function computePcmMetrics(pcmBuffer) {
+  const sampleCount = Math.floor(pcmBuffer.length / 2);
+  if (sampleCount <= 0) return { rms: 0, peak: 0, sampleCount: 0 };
+
+  let sumSq = 0;
+  let peak = 0;
+
+  for (let i = 0; i < sampleCount; i++) {
+    const v = pcmBuffer.readInt16LE(i * 2);
+    const a = Math.abs(v) / 32768;
+    sumSq += a * a;
+    if (a > peak) peak = a;
+  }
+
+  const rms = Math.sqrt(sumSq / sampleCount);
+  return { rms, peak, sampleCount };
+}
+
+function pcm16leToWavBuffer(pcmBuffer, sampleRate, channels, bitsPerSample) {
+  const byteRate = (sampleRate * channels * bitsPerSample) / 8;
+  const blockAlign = (channels * bitsPerSample) / 8;
+  const dataSize = pcmBuffer.length;
+
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8);
+
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16); // PCM
+  header.writeUInt16LE(1, 20); // AudioFormat=1 PCM
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  return Buffer.concat([header, pcmBuffer]);
+}
+
+function sanitizeTextForTTS(text) {
+  let t = String(text ?? "").trim();
+  if (!t) return "";
+  if (t.length > MAX_TEXT_CHARS) t = t.slice(0, MAX_TEXT_CHARS);
+  return t;
+}
+
+// -------------------------
+// Language normalization (simple + safe)
 // -------------------------
 const LANG_NAME_TO_CODE = {
   français: "fr",
   francais: "fr",
   french: "fr",
-  english: "en",
   anglais: "en",
-  spanish: "es",
-  espagnol: "es",
+  english: "en",
   español: "es",
-  german: "de",
-  allemand: "de",
+  espagnol: "es",
+  spanish: "es",
   deutsch: "de",
-  italian: "it",
-  italien: "it",
+  allemand: "de",
+  german: "de",
   italiano: "it",
-  portuguese: "pt",
-  portugais: "pt",
+  italien: "it",
+  italian: "it",
   português: "pt",
-  chines: "zh",
+  portugais: "pt",
+  portuguese: "pt",
+  中文: "zh",
   chinois: "zh",
   chinese: "zh",
   العربية: "ar",
@@ -122,20 +262,21 @@ function normalizeLangCode(lang) {
   const trimmed = lang.trim();
   if (!trimmed) return "";
 
+  // already iso code (fr / en / es etc)
   if (/^[a-z]{2,3}$/i.test(trimmed)) return trimmed.toLowerCase();
 
-  if (/^[a-z]{2,3}[-_][a-z]{2,4}$/i.test(trimmed)) {
-    return trimmed.split(/[-_]/)[0].toLowerCase();
-  }
+  // bcp47 (en-US / pt-BR)
+  if (/^[a-z]{2,3}[-_][a-z]{2,4}$/i.test(trimmed)) return trimmed.split(/[-_]/)[0].toLowerCase();
 
   const lower = trimmed.toLowerCase();
   if (LANG_NAME_TO_CODE[lower]) return LANG_NAME_TO_CODE[lower];
 
+  // partial match
   for (const [name, code] of Object.entries(LANG_NAME_TO_CODE)) {
     if (lower.includes(name) || name.includes(lower)) return code;
   }
 
-  return trimmed.toLowerCase();
+  return lower;
 }
 
 function whisperLanguageHint(rawLang) {
@@ -162,173 +303,17 @@ function mapDeepLSourceLang(lang) {
 
 function isDeepLWrongEndpointMessage(rawText) {
   const t = String(rawText || "");
-  return t.includes("Wrong endpoint") || t.toLowerCase().includes("wrong endpoint");
+  return t.toLowerCase().includes("wrong endpoint");
 }
 
 // -------------------------
-// OpenAI client
-// -------------------------
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
-// -------------------------
-// Express
-// -------------------------
-const app = express();
-app.disable("x-powered-by");
-
-app.get("/", (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: "instant-talk-backend",
-    wsPath: WS_PATH,
-    models: {
-      stt: OPENAI_STT_MODEL,
-      tts: OPENAI_TTS_MODEL,
-      translation: OPENAI_TRANSLATION_MODEL,
-    },
-    voice: OPENAI_TTS_VOICE,
-    deepl: { enabled: Boolean(DEEPL_API_KEY), primaryEndpoint: DEEPL_API_URL_PRIMARY || null },
-    audio: {
-      sampleRate: AUDIO_SAMPLE_RATE,
-      channels: AUDIO_CHANNELS,
-      bits: AUDIO_BITS_PER_SAMPLE,
-      guards: {
-        MIN_AUDIO_MS_FOR_STT,
-        MIN_RMS,
-        MAX_CLIP_RATE,
-      },
-      KEEP_WAV_DEBUG,
-    },
-  });
-});
-
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
-
-// -------------------------
-// HTTP + WS (IMPORTANT: single instance -> httpServer)
-// -------------------------
-const httpServer = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
-
-httpServer.on("upgrade", (req, socket, head) => {
-  try {
-    const url = new URL(req.url || "", `http://${req.headers.host || "localhost"}`);
-    if (url.pathname !== WS_PATH) {
-      socket.destroy();
-      return;
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } catch {
-    socket.destroy();
-  }
-});
-
-// -------------------------
-// Utils
-// -------------------------
-function nowMs() {
-  return Date.now();
-}
-
-function makeConnId() {
-  return crypto.randomBytes(8).toString("hex");
-}
-
-function safeJsonParse(str) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return null;
-  }
-}
-
-function sendJson(ws, obj) {
-  if (ws.readyState !== ws.OPEN) return;
-  ws.send(JSON.stringify(obj));
-}
-
-function truncate(s, max = 220) {
-  const str = String(s ?? "");
-  return str.length <= max ? str : str.slice(0, max) + "…";
-}
-
-function sanitizeTextForTTS(text) {
-  let t = String(text ?? "").trim();
-  if (!t) return "";
-  if (t.length > MAX_TEXT_CHARS) t = t.slice(0, MAX_TEXT_CHARS);
-  return t;
-}
-
-function pcmBytesToDurationMs(pcmBytes) {
-  const denom = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * BYTES_PER_SAMPLE;
-  if (!denom) return 0;
-  return Math.round((pcmBytes / denom) * 1000);
-}
-
-function computePcmMetrics(pcmBuffer) {
-  const sampleCount = Math.floor(pcmBuffer.length / 2);
-  if (sampleCount <= 0) return { rms: 0, peak: 0, clipRate: 0, sampleCount: 0 };
-
-  let sumSq = 0;
-  let peak = 0;
-  let clipCount = 0;
-
-  for (let i = 0; i < sampleCount; i++) {
-    const v = pcmBuffer.readInt16LE(i * 2);
-    const a = Math.abs(v) / 32768;
-    sumSq += a * a;
-    if (a > peak) peak = a;
-    if (a >= 0.98) clipCount++;
-  }
-
-  const rms = Math.sqrt(sumSq / sampleCount);
-  const clipRate = clipCount / sampleCount;
-
-  return { rms, peak, clipRate, sampleCount };
-}
-
-function pcm16leToWavBuffer(pcmBuffer, sampleRate, channels, bitsPerSample) {
-  const byteRate = (sampleRate * channels * bitsPerSample) / 8;
-  const blockAlign = (channels * bitsPerSample) / 8;
-  const dataSize = pcmBuffer.length;
-
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + dataSize, 4);
-  header.write("WAVE", 8);
-
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-
-  header.write("data", 36);
-  header.writeUInt32LE(dataSize, 40);
-
-  return Buffer.concat([header, pcmBuffer]);
-}
-
-function cleanupWav(wavPath) {
-  if (!KEEP_WAV_DEBUG) {
-    try {
-      fs.unlinkSync(wavPath);
-    } catch {}
-  } else {
-    console.log(`[WAV_DEBUG] kept wav at ${wavPath}`);
-  }
-}
-
-// -------------------------
-// DeepL translate (with endpoint retry)
+// DeepL translate (optional)
 // -------------------------
 async function deeplTranslate({ text, sourceLang, targetLang }) {
   const mappedTarget = mapDeepLTargetLang(targetLang);
   const mappedSource = mapDeepLSourceLang(sourceLang);
   const endpointsToTry = [DEEPL_API_URL_PRIMARY, DEEPL_API_URL_ALT].filter(Boolean);
+
   let lastErr = null;
 
   for (const endpoint of endpointsToTry) {
@@ -351,22 +336,23 @@ async function deeplTranslate({ text, sourceLang, targetLang }) {
 
       if (!resp.ok) {
         if (resp.status === 403 && isDeepLWrongEndpointMessage(raw)) {
-          console.warn(`[DEEPL] wrong endpoint on ${endpoint} -> retry other`);
           lastErr = Object.assign(new Error(`DeepL wrong endpoint at ${endpoint}`), {
-            details: { status: resp.status, body: raw, endpoint, ms, mappedTarget },
+            details: { status: resp.status, body: raw, endpoint, ms },
           });
           continue;
         }
-        const err = new Error(`DeepL HTTP ${resp.status}: ${truncate(raw, 400)}`);
-        err.details = { status: resp.status, body: raw, endpoint, ms, mappedTarget };
+        const err = Object.assign(new Error(`DeepL HTTP ${resp.status}: ${truncate(raw, 400)}`), {
+          details: { status: resp.status, body: raw, endpoint, ms },
+        });
         throw err;
       }
 
       const json = safeJsonParse(raw);
       const out = json?.translations?.[0]?.text;
       if (!out) {
-        const err = new Error(`DeepL invalid response: ${truncate(raw, 400)}`);
-        err.details = { endpoint, ms, mappedTarget };
+        const err = Object.assign(new Error(`DeepL invalid response: ${truncate(raw, 400)}`), {
+          details: { endpoint, ms },
+        });
         throw err;
       }
 
@@ -391,19 +377,18 @@ async function deeplTranslate({ text, sourceLang, targetLang }) {
 // -------------------------
 async function openaiTranslate({ text, sourceLang, targetLang }) {
   const t0 = nowMs();
+  const system = [
+    "You are a translation engine for real-time voice conversation.",
+    "Translate naturally and accurately.",
+    "Return ONLY the translated text.",
+    "No quotes, no explanations, no extra lines.",
+  ].join(" ");
 
-  const srcName = sourceLang || "auto-detect";
-  const tgtName = targetLang;
-
-  const system =
-    "You are a translation engine for real-time voice conversation. " +
-    "Translate naturally and accurately. Return ONLY the translated text (no quotes, no explanations).";
-
-  const user = `Translate from ${srcName} to ${tgtName}:\n\n${text}`;
+  const user = `Translate from ${sourceLang || "auto"} to ${targetLang}:\n\n${text}`;
 
   const resp = await openai.chat.completions.create({
     model: OPENAI_TRANSLATION_MODEL,
-    temperature: 0.15,
+    temperature: 0.1,
     max_tokens: 1024,
     messages: [
       { role: "system", content: system },
@@ -412,15 +397,13 @@ async function openaiTranslate({ text, sourceLang, targetLang }) {
   });
 
   const out = resp?.choices?.[0]?.message?.content?.trim() || "";
-  const ms = nowMs() - t0;
-
-  return { text: out, provider: "openai", ms };
+  return { text: out, provider: "openai", ms: nowMs() - t0 };
 }
 
 // -------------------------
-// OpenAI STT
+// OpenAI STT (Whisper)
 // -------------------------
-async function openaiTranscribeVerbose({ wavPath, languageHint }) {
+async function openaiTranscribeWavVerbose({ wavPath, languageHint }) {
   const t0 = nowMs();
   const file = fs.createReadStream(wavPath);
 
@@ -436,11 +419,16 @@ async function openaiTranscribeVerbose({ wavPath, languageHint }) {
   const result = await openai.audio.transcriptions.create(params);
   const ms = nowMs() - t0;
 
+  const text = (result?.text || "").trim();
+  const language = result?.language || "";
+  const segments = Array.isArray(result?.segments) ? result.segments : [];
+
   return {
-    text: (result?.text || "").trim(),
+    text,
     ms,
     model: OPENAI_STT_MODEL,
-    language: result?.language || "",
+    language,
+    segmentsCount: segments.length,
   };
 }
 
@@ -458,8 +446,7 @@ async function openaiTtsMp3({ text, voice }) {
   });
 
   const buffer = Buffer.from(await mp3.arrayBuffer());
-  const ms = nowMs() - t0;
-  return { buffer, ms, model: OPENAI_TTS_MODEL };
+  return { buffer, ms: nowMs() - t0, model: OPENAI_TTS_MODEL };
 }
 
 // -------------------------
@@ -474,7 +461,7 @@ function makeDefaultSessionConfig() {
   };
 }
 
-function makeConnectionState() {
+function makeConnState() {
   return {
     id: makeConnId(),
     config: makeDefaultSessionConfig(),
@@ -496,115 +483,15 @@ function appendPcm(state, buf) {
   state.pcmBytes += buf.length;
 }
 
-// -------------------------
-// WS
-// -------------------------
-wss.on("connection", (ws, req) => {
-  const state = makeConnectionState();
-
-  const ip =
-    (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
-    req.socket.remoteAddress ||
-    "unknown";
-
-  console.log(`[WS][${state.id}] connected ip=${ip}`);
-
-  sendJson(ws, {
-    type: "ready",
-    id: state.id,
-    wsPath: WS_PATH,
-    models: {
-      stt: OPENAI_STT_MODEL,
-      tts: OPENAI_TTS_MODEL,
-      translation: OPENAI_TRANSLATION_MODEL,
-    },
-    voice: state.config.voice,
-    deepl: { enabled: Boolean(DEEPL_API_KEY), endpoint: DEEPL_API_URL_PRIMARY || null },
-  });
-
-  // keepalive
-  ws.isAlive = true;
-  ws.on("pong", () => (ws.isAlive = true));
-
-  const pingTimer = setInterval(() => {
-    if (ws.readyState !== ws.OPEN) return;
-    if (!ws.isAlive) {
-      console.warn(`[WS][${state.id}] ping timeout -> terminate`);
-      try {
-        ws.terminate();
-      } catch {}
-      return;
-    }
-    ws.isAlive = false;
+function cleanupWav(wavPath) {
+  if (!KEEP_WAV_DEBUG) {
     try {
-      ws.ping();
+      fs.unlinkSync(wavPath);
     } catch {}
-  }, WS_PING_INTERVAL_MS);
-
-  ws.on("close", (code, reason) => {
-    clearInterval(pingTimer);
-    console.log(`[WS][${state.id}] closed code=${code} reason=${truncate(reason?.toString?.() || "", 120)}`);
-  });
-
-  ws.on("error", (err) => console.error(`[WS][${state.id}] error`, err));
-
-  ws.on("message", async (data, isBinary) => {
-    if (isBinary) {
-      const buf = Buffer.from(data);
-      appendPcm(state, buf.length % 2 === 0 ? buf : buf.slice(0, buf.length - 1));
-
-      if (state.pcmBytes > MAX_PCM_BYTES_PER_UTTERANCE) {
-        console.error(`[AUDIO][${state.id}] overflow pcmBytes=${state.pcmBytes} max=${MAX_PCM_BYTES_PER_UTTERANCE}`);
-        resetAudioBuffer(state);
-        sendJson(ws, {
-          type: "error",
-          stage: "ingest",
-          message: "Audio buffer overflow. Utterance dropped.",
-          details: { maxBytes: MAX_PCM_BYTES_PER_UTTERANCE },
-        });
-      }
-      return;
-    }
-
-    const msg = safeJsonParse(data.toString("utf8"));
-    if (!msg || typeof msg !== "object") return;
-
-    const type = String(msg.type || "").trim();
-
-    if (type === "config") {
-      const next = { ...state.config };
-
-      if (typeof msg.sourceLang === "string") next.sourceLang = normalizeLangCode(msg.sourceLang);
-      if (typeof msg.targetLang === "string") next.targetLang = normalizeLangCode(msg.targetLang) || "en";
-      if (typeof msg.auto_bidi === "boolean") next.auto_bidi = msg.auto_bidi;
-      if (typeof msg.voice === "string" && msg.voice.trim()) next.voice = msg.voice.trim();
-
-      state.config = next;
-
-      console.log(`[CFG][${state.id}] sourceLang=${next.sourceLang || "auto"} targetLang=${next.targetLang} voice=${next.voice}`);
-      sendJson(ws, { type: "config_ack", config: next });
-      return;
-    }
-
-    if (type === "reset") {
-      resetAudioBuffer(state);
-      state.pendingFlush = false;
-      console.log(`[AUDIO][${state.id}] reset`);
-      sendJson(ws, { type: "reset_ack" });
-      return;
-    }
-
-    if (type === "flush") {
-      if (state.isProcessing) {
-        state.pendingFlush = true;
-        sendJson(ws, { type: "flush_ack", status: "queued" });
-        return;
-      }
-      await processUtterance(ws, state, msg);
-      return;
-    }
-  });
-});
+  } else {
+    console.log(`[WAV_DEBUG] kept wav at ${wavPath}`);
+  }
+}
 
 // -------------------------
 // Pipeline
@@ -616,34 +503,37 @@ async function processUtterance(ws, state, flushMsg) {
   const seq = ++state.seq;
   const startedAt = nowMs();
 
-  const durationMs = pcmBytesToDurationMs(state.pcmBytes);
   const pcm = state.pcmBytes > 0 ? Buffer.concat(state.pcmChunks, state.pcmBytes) : Buffer.alloc(0);
+  const durationMs = pcmBytesToDurationMs(pcm.length);
   const metrics = computePcmMetrics(pcm);
-
-  console.log(
-    `[AUDIO][${state.id}][#${seq}] pcmBytes=${state.pcmBytes} durationMs=${durationMs} rms=${metrics.rms.toFixed(4)} peak=${metrics.peak.toFixed(4)} clipRate=${metrics.clipRate.toFixed(4)}`
-  );
 
   const meta = {
     seq,
-    pcmBytes: state.pcmBytes,
+    pcmBytes: pcm.length,
     durationMs,
     rms: metrics.rms,
     peak: metrics.peak,
-    clipRate: metrics.clipRate,
     sourceLang: state.config.sourceLang || "auto",
     targetLang: state.config.targetLang || "en",
     voice: state.config.voice || OPENAI_TTS_VOICE,
   };
 
+  // freeze & clear buffer immediately (prevents deadlocks)
+  resetAudioBuffer(state);
+
   try {
-    if (state.pcmBytes <= 0) {
+    console.log(
+      `[AUDIO][${state.id}][#${seq}] pcmBytes=${meta.pcmBytes} durationMs=${durationMs} rms=${metrics.rms.toFixed(
+        4
+      )} peak=${metrics.peak.toFixed(4)}`
+    );
+
+    if (meta.pcmBytes <= 0) {
       sendJson(ws, { type: "error", stage: "ingest", message: "Flush received but no audio buffered.", details: meta });
       return;
     }
 
     if (durationMs < MIN_AUDIO_MS_FOR_STT) {
-      resetAudioBuffer(state);
       sendJson(ws, {
         type: "error",
         stage: "stt",
@@ -654,7 +544,6 @@ async function processUtterance(ws, state, flushMsg) {
     }
 
     if (metrics.rms < MIN_RMS) {
-      resetAudioBuffer(state);
       sendJson(ws, {
         type: "error",
         stage: "stt",
@@ -664,19 +553,11 @@ async function processUtterance(ws, state, flushMsg) {
       return;
     }
 
-    if (metrics.clipRate > MAX_CLIP_RATE) {
-      resetAudioBuffer(state);
-      sendJson(ws, {
-        type: "error",
-        stage: "stt",
-        message: `Audio clipped (clipRate=${metrics.clipRate.toFixed(4)}).`,
-        details: { ...meta, code: "clipped", maxClipRate: MAX_CLIP_RATE },
-      });
-      return;
-    }
-
-    // Freeze and reset buffer (important: do it once)
-    resetAudioBuffer(state);
+    console.log(
+      `[PIPE][${state.id}][#${seq}] start src=${meta.sourceLang} tgt=${meta.targetLang} langHint=${
+        whisperLanguageHint(state.config.sourceLang) || "auto"
+      }`
+    );
 
     // WAV
     const wav = pcm16leToWavBuffer(pcm, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITS_PER_SAMPLE);
@@ -684,32 +565,52 @@ async function processUtterance(ws, state, flushMsg) {
     fs.writeFileSync(wavPath, wav);
 
     // STT
-    const stt = await openaiTranscribeVerbose({ wavPath, languageHint: state.config.sourceLang || undefined });
+    const stt = await openaiTranscribeWavVerbose({
+      wavPath,
+      languageHint: state.config.sourceLang || undefined,
+    });
+
     cleanupWav(wavPath);
 
-    console.log(`[STT][${state.id}][#${seq}] model=${stt.model} ms=${stt.ms} lang=${stt.language || "-"} text="${truncate(stt.text, 240)}"`);
+    console.log(
+      `[STT][${state.id}][#${seq}] model=${stt.model} ms=${stt.ms} lang=${stt.language || "-"} segments=${
+        stt.segmentsCount
+      } text="${truncate(stt.text, 240)}"`
+    );
 
     const sttText = (stt.text || "").trim();
     if (!sttText) {
-      sendJson(ws, { type: "error", stage: "stt", message: "STT returned empty text.", details: { ...meta, detectedLang: stt.language } });
+      sendJson(ws, {
+        type: "error",
+        stage: "stt",
+        message: "STT returned empty text.",
+        details: { ...meta, detectedLang: stt.language || null },
+      });
       return;
     }
 
-    sendJson(ws, { type: "stt", text: sttText, model: stt.model, ms: stt.ms, seq, detectedLang: stt.language || null });
+    sendJson(ws, {
+      type: "stt",
+      text: sttText,
+      model: stt.model,
+      ms: stt.ms,
+      seq,
+      detectedLang: stt.language || null,
+      audio: { durationMs, rms: metrics.rms, peak: metrics.peak },
+    });
 
     // Translation
-    const srcNorm = normalizeLangCode(state.config.sourceLang);
-    const tgtNorm = normalizeLangCode(state.config.targetLang) || "en";
+    const srcNorm = normalizeLangCode(state.config.sourceLang || "");
+    const tgtNorm = normalizeLangCode(state.config.targetLang || "en") || "en";
 
     let translatedText = sttText;
     let provider = "none";
     let translationMs = 0;
 
     if (srcNorm && tgtNorm && srcNorm === tgtNorm) {
-      console.log(`[TRANSL][${state.id}][#${seq}] SKIP (same lang ${srcNorm})`);
+      console.log(`[TRANSL][${state.id}][#${seq}] SKIP same lang=${srcNorm}`);
     } else {
       const t0 = nowMs();
-
       if (DEEPL_API_KEY) {
         try {
           const r = await deeplTranslate({
@@ -720,32 +621,45 @@ async function processUtterance(ws, state, flushMsg) {
           translatedText = r.text;
           provider = "deepl";
           translationMs = nowMs() - t0;
+          console.log(
+            `[TRANSL][${state.id}][#${seq}] provider=deepl ms=${translationMs} endpoint=${r.endpoint} text="${truncate(
+              translatedText,
+              240
+            )}"`
+          );
         } catch (e) {
-          console.warn(`[TRANSL][${state.id}][#${seq}] DeepL failed -> fallback OpenAI: ${truncate(e?.message || "", 160)}`);
-          const r = await openaiTranslate({
-            text: sttText,
-            sourceLang: srcNorm || "auto",
-            targetLang: tgtNorm,
-          });
+          console.warn(
+            `[TRANSL][${state.id}][#${seq}] DeepL failed -> fallback OpenAI err="${truncate(e?.message, 200)}"`
+          );
+          const r = await openaiTranslate({ text: sttText, sourceLang: srcNorm || "auto", targetLang: tgtNorm });
           translatedText = r.text;
           provider = "openai_fallback";
           translationMs = nowMs() - t0;
+          console.log(
+            `[TRANSL][${state.id}][#${seq}] provider=openai_fallback ms=${translationMs} text="${truncate(
+              translatedText,
+              240
+            )}"`
+          );
         }
       } else {
-        const r = await openaiTranslate({
-          text: sttText,
-          sourceLang: srcNorm || "auto",
-          targetLang: tgtNorm,
-        });
+        const r = await openaiTranslate({ text: sttText, sourceLang: srcNorm || "auto", targetLang: tgtNorm });
         translatedText = r.text;
         provider = "openai";
         translationMs = nowMs() - t0;
+        console.log(`[TRANSL][${state.id}][#${seq}] provider=openai ms=${translationMs} text="${truncate(translatedText, 240)}"`);
       }
-
-      console.log(`[TRANSL][${state.id}][#${seq}] provider=${provider} ms=${translationMs} text="${truncate(translatedText, 240)}"`);
     }
 
-    sendJson(ws, { type: "translation", text: translatedText, provider, sourceLang: srcNorm || "auto", targetLang: tgtNorm, ms: translationMs, seq });
+    sendJson(ws, {
+      type: "translation",
+      text: translatedText,
+      provider,
+      sourceLang: srcNorm || "auto",
+      targetLang: tgtNorm,
+      ms: translationMs,
+      seq,
+    });
 
     // TTS
     const ttsInput = sanitizeTextForTTS(translatedText);
@@ -784,7 +698,6 @@ async function processUtterance(ws, state, flushMsg) {
         seq,
         totalMs,
         config: state.config,
-        audio: meta,
         flushMsg: flushMsg && typeof flushMsg === "object" ? flushMsg : null,
         error: {
           name: err?.name || "Error",
@@ -797,6 +710,7 @@ async function processUtterance(ws, state, flushMsg) {
   } finally {
     state.isProcessing = false;
 
+    // If flush was queued while processing, run once more if there is audio
     if (state.pendingFlush) {
       state.pendingFlush = false;
       if (state.pcmBytes > 0 && ws.readyState === ws.OPEN) {
@@ -809,10 +723,124 @@ async function processUtterance(ws, state, flushMsg) {
 }
 
 // -------------------------
+// WS handler
+// -------------------------
+wss.on("connection", (ws, req) => {
+  const state = makeConnState();
+
+  const ip =
+    (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
+    req.socket.remoteAddress ||
+    "unknown";
+
+  console.log(`[WS][${state.id}] connected ip=${ip}`);
+
+  sendJson(ws, {
+    type: "ready",
+    id: state.id,
+    wsPath: WS_PATH,
+    models: { stt: OPENAI_STT_MODEL, tts: OPENAI_TTS_MODEL, translation: OPENAI_TRANSLATION_MODEL },
+    voice: state.config.voice,
+    deepl: { enabled: Boolean(DEEPL_API_KEY), primary: DEEPL_API_URL_PRIMARY || null },
+  });
+
+  // keepalive
+  ws.isAlive = true;
+  ws.on("pong", () => (ws.isAlive = true));
+
+  const pingTimer = setInterval(() => {
+    if (ws.readyState !== ws.OPEN) return;
+    if (!ws.isAlive) {
+      console.warn(`[WS][${state.id}] ping timeout -> terminate`);
+      try {
+        ws.terminate();
+      } catch {}
+      return;
+    }
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch {}
+  }, WS_PING_INTERVAL_MS);
+
+  ws.on("close", (code, reason) => {
+    clearInterval(pingTimer);
+    console.log(`[WS][${state.id}] closed code=${code} reason=${truncate(reason?.toString?.() || "", 120)}`);
+  });
+
+  ws.on("error", (err) => console.error(`[WS][${state.id}] error`, err));
+
+  ws.on("message", async (data, isBinary) => {
+    // Binary = PCM audio
+    if (isBinary) {
+      const buf = Buffer.from(data);
+
+      // keep even number of bytes (Int16)
+      const fixed = buf.length % 2 === 0 ? buf : buf.slice(0, buf.length - 1);
+
+      appendPcm(state, fixed);
+
+      if (state.pcmBytes > MAX_PCM_BYTES_PER_UTTERANCE) {
+        console.error(`[AUDIO][${state.id}] overflow pcmBytes=${state.pcmBytes} max=${MAX_PCM_BYTES_PER_UTTERANCE}`);
+        resetAudioBuffer(state);
+        sendJson(ws, {
+          type: "error",
+          stage: "ingest",
+          message: "Audio buffer overflow. Utterance dropped.",
+          details: { maxBytes: MAX_PCM_BYTES_PER_UTTERANCE },
+        });
+      }
+      return;
+    }
+
+    // Text = control JSON
+    const str = data.toString("utf8");
+    const msg = safeJsonParse(str);
+    if (!msg || typeof msg !== "object") return;
+
+    const type = String(msg.type || "").trim();
+
+    if (type === "config") {
+      const next = { ...state.config };
+
+      if (typeof msg.sourceLang === "string") next.sourceLang = normalizeLangCode(msg.sourceLang);
+      if (typeof msg.targetLang === "string") next.targetLang = normalizeLangCode(msg.targetLang) || "en";
+      if (typeof msg.auto_bidi === "boolean") next.auto_bidi = msg.auto_bidi;
+      if (typeof msg.voice === "string" && msg.voice.trim()) next.voice = msg.voice.trim();
+
+      state.config = next;
+
+      console.log(`[CFG][${state.id}] sourceLang=${next.sourceLang || "auto"} targetLang=${next.targetLang} voice=${next.voice} auto_bidi=${next.auto_bidi}`);
+      sendJson(ws, { type: "config_ack", config: next });
+      return;
+    }
+
+    if (type === "reset") {
+      resetAudioBuffer(state);
+      state.pendingFlush = false;
+      console.log(`[AUDIO][${state.id}] reset`);
+      sendJson(ws, { type: "reset_ack" });
+      return;
+    }
+
+    if (type === "flush") {
+      if (state.isProcessing) {
+        state.pendingFlush = true;
+        sendJson(ws, { type: "flush_ack", status: "queued" });
+        return;
+      }
+      sendJson(ws, { type: "flush_ack", status: "processing" });
+      await processUtterance(ws, state, msg);
+      return;
+    }
+  });
+});
+
+// -------------------------
 // Start
 // -------------------------
-httpServer.listen(PORT, () => {
-  console.log(`[BOOT] 🚀 Instant Talk Backend STABLE v2.1`);
+server.listen(PORT, () => {
+  console.log(`[BOOT] 🚀 Instant Talk Backend v2.1`);
   console.log(`[BOOT] listening :${PORT}`);
   console.log(`[BOOT] WS path: ${WS_PATH}`);
   console.log(`[BOOT] OpenAI STT model: ${OPENAI_STT_MODEL}`);
@@ -823,5 +851,5 @@ httpServer.listen(PORT, () => {
     console.log(`[BOOT] DeepL endpoint(primary): ${DEEPL_API_URL_PRIMARY}`);
     console.log(`[BOOT] DeepL endpoint(alt): ${DEEPL_API_URL_ALT}`);
   }
-  console.log(`[BOOT] Guards: MIN_MS=${MIN_AUDIO_MS_FOR_STT} MIN_RMS=${MIN_RMS} MAX_CLIP=${MAX_CLIP_RATE}`);
+  console.log(`[BOOT] Guards: MIN_AUDIO_MS_FOR_STT=${MIN_AUDIO_MS_FOR_STT} MIN_RMS=${MIN_RMS}`);
 });
