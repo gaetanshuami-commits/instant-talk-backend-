@@ -1,30 +1,150 @@
-Base44
+// wsPipeline.js
+// Branch this into your ws connection handler.
+// Assumes you already have OpenAI + DeepL clients wired.
 
-Voici le prompt complet à coller dans ChatGPT :
+const MIN_AUDIO_MS = 420;
+const MAX_AUDIO_MS = 8000; // safety
+const SAMPLE_RATE = 16000;
+const BYTES_PER_SAMPLE = 2; // Int16
 
-Contexte : J’ai une app de visioconférence React qui utilise LiveKit (livekit-client v2) pour les appels vidéo. J’ai aussi un hook custom qui se connecte à un backend WebSocket, capte le micro, envoie l’audio en PCM 16kHz, reçoit une transcription STT + traduction + TTS (audio MP3 base64).useInstantTalk
+function audioMsFromBytes(byteLen) {
+  const samples = byteLen / BYTES_PER_SAMPLE;
+  return (samples / SAMPLE_RATE) * 1000;
+}
 
-Le TTS est déjà joué localement via un , et est aussi disponible comme MediaStream (via ), exposé par le hook sous le nom .AudioContextAudioContext.createMediaStreamDestination()ttsStream
+function isSuspectText(text) {
+  if (!text) return true;
+  const t = text.trim();
+  if (!t) return true;
 
-Ce que je veux : Quand la traduction est active, l’autre participant LiveKit doit entendre ma voix traduite (TTS) au lieu de mon micro réel.
+  // too short
+  if (t.length < 2) return true;
 
-Stack :
+  // must contain at least one letter (latin or extended). This filters "??" or random symbols.
+  const hasLetter = /[A-Za-zÀ-ÖØ-öø-ÿĀ-žА-Яа-я一-龯ぁ-ゟァ-ヿ]/.test(t);
+  if (!hasLetter) return true;
 
-livekit-client v2 (, , , RoomLocalParticipantcreateLocalAudioTrackLocalAudioTrack)
-Accroches de réaction
-Le est un standard avec une piste audiottsStreamMediaStream
-Ce que j’ai dans VideoRoom.jsx :
+  // blacklist typical hallucinations for short/noisy segments
+  const lower = t.toLowerCase();
+  const blacklist = new Set(["you", "boing", "boing boing", "thanks", "thank you"]);
+  if (blacklist.has(lower)) return true;
 
-Une instance (objet de LiveKit) dans un ref : roomRoomroomRef.current
-La piste micro locale est publiée via room.localParticipant.publishTrack(...)
-Un état (booléen)isTranslationActive
-Le arrive via un callback ttsStreamonTtsStream(stream)
-Question / Tâche : Écris-moi la logique React complète pour :
+  return false;
+}
 
-Quand arrive ET : unpublish la piste micro locale, puis publish la piste TTS comme LiveKitttsStreamisTranslationActive === trueLocalAudioTrack
-Quand repasse à : unpublish la piste TTS, puis republish le micro réelisTranslationActivefalse
-Gérer proprement les refs pour éviter les double-publish
-Utiliser les bonnes APIs LiveKit v2 (, , createLocalAudioTrackroom.localParticipant.publishTrackroom.localParticipant.unpublishTrack)
-Donne-moi le code complet du + des fonctions helper à intégrer dans mon composant .useEffectVideoRoom
+/**
+ * @param {WebSocket} ws
+ * @param {object} deps - your dependencies (openai, deepl, tts)
+ */
+function createWsPipeline(ws, deps) {
+  let config = { fromLang: "en", toLang: "fr", mode: "continuous" };
+  let audioChunks = [];
+  let audioBytes = 0;
 
-Colle ça directement dans ChatGPT et envoie-moi le code qu’il génère, je l’intègre immédiatement.
+  function send(obj) {
+    try {
+      ws.send(JSON.stringify(obj));
+    } catch {}
+  }
+
+  function resetBuffer() {
+    audioChunks = [];
+    audioBytes = 0;
+  }
+
+  async function runPipeline() {
+    const totalMs = audioMsFromBytes(audioBytes);
+
+    if (totalMs < MIN_AUDIO_MS) {
+      send({ type: "stt", skipped: true, reason: "audio_too_short", audioMs: Math.round(totalMs) });
+      resetBuffer();
+      return;
+    }
+    if (totalMs > MAX_AUDIO_MS) {
+      send({ type: "stt", skipped: true, reason: "audio_too_long", audioMs: Math.round(totalMs) });
+      resetBuffer();
+      return;
+    }
+
+    // Merge audio
+    const merged = Buffer.concat(audioChunks, audioBytes);
+    resetBuffer();
+
+    try {
+      // 1) STT
+      const sttText = await deps.stt(merged, config.fromLang); // implement deps.stt
+      if (!sttText || !sttText.trim()) {
+        send({ type: "stt", skipped: true, reason: "stt_empty" });
+        return;
+      }
+      if (isSuspectText(sttText)) {
+        send({ type: "stt", skipped: true, reason: "stt_suspect", text: sttText });
+        return;
+      }
+      send({ type: "stt", text: sttText });
+
+      // 2) Translation (DeepL priority)
+      const translated = await deps.translate(sttText, config.fromLang, config.toLang); // implement deps.translate
+      if (!translated || !translated.trim()) {
+        send({ type: "error", code: "TRANSL_EMPTY", message: "Translation returned empty text" });
+        return;
+      }
+      send({ type: "translation", text: translated });
+
+      // 3) TTS
+      const mp3Base64 = await deps.tts(translated, config.toLang); // implement deps.tts
+      if (!mp3Base64) {
+        send({ type: "error", code: "TTS_EMPTY", message: "TTS returned empty audio" });
+        return;
+      }
+      send({ type: "tts", audioB64: mp3Base64 });
+    } catch (err) {
+      send({ type: "error", code: "PIPELINE_ERROR", message: err?.message || "Unknown pipeline error" });
+    }
+  }
+
+  ws.on("message", async (data, isBinary) => {
+    try {
+      if (!isBinary) {
+        const msg = JSON.parse(data.toString("utf8"));
+        if (msg.type === "config") {
+          config = {
+            fromLang: String(msg.fromLang || "en"),
+            toLang: String(msg.toLang || "fr"),
+            mode: msg.mode === "push_to_talk" ? "push_to_talk" : "continuous",
+          };
+          return;
+        }
+        if (msg.type === "reset") {
+          resetBuffer();
+          return;
+        }
+        if (msg.type === "flush") {
+          // flush boundary: run STT/translation/TTS on current buffer
+          if (audioBytes > 0) await runPipeline();
+          return;
+        }
+        return;
+      }
+
+      // Binary PCM chunk
+      const buf = Buffer.from(data);
+      audioChunks.push(buf);
+      audioBytes += buf.length;
+
+      // Optional: if you want auto-run when buffer large
+      const totalMs = audioMsFromBytes(audioBytes);
+      if (config.mode === "continuous" && totalMs >= 1500) {
+        await runPipeline();
+      }
+    } catch (err) {
+      send({ type: "error", code: "WS_MSG_ERROR", message: err?.message || "WS message error" });
+    }
+  });
+
+  ws.on("close", () => {
+    resetBuffer();
+  });
+}
+
+module.exports = { createWsPipeline };
