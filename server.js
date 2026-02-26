@@ -1,194 +1,30 @@
-import http from "http";
-import express from "express";
-import fs from "fs";
-import path from "path";
-import os from "os";
-import { WebSocketServer } from "ws";
-import OpenAI from "openai";
+Base44
 
-/* =========================
-   CONFIG
-========================= */
+Voici le prompt complet à coller dans ChatGPT :
 
-const PORT = process.env.PORT || 8080;
-const WS_PATH = "/ws";
+Contexte : J’ai une app de visioconférence React qui utilise LiveKit (livekit-client v2) pour les appels vidéo. J’ai aussi un hook custom qui se connecte à un backend WebSocket, capte le micro, envoie l’audio en PCM 16kHz, reçoit une transcription STT + traduction + TTS (audio MP3 base64).useInstantTalk
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error("❌ Missing OPENAI_API_KEY");
-  process.exit(1);
-}
+Le TTS est déjà joué localement via un , et est aussi disponible comme MediaStream (via ), exposé par le hook sous le nom .AudioContextAudioContext.createMediaStreamDestination()ttsStream
 
-const OPENAI_STT_MODEL = process.env.OPENAI_STT_MODEL || "whisper-1";
-const OPENAI_TTS_MODEL = process.env.OPENAI_TTS_MODEL || "tts-1";
-const OPENAI_TRANSLATION_MODEL = process.env.OPENAI_TRANSLATION_MODEL || "gpt-4o-mini";
+Ce que je veux : Quand la traduction est active, l’autre participant LiveKit doit entendre ma voix traduite (TTS) au lieu de mon micro réel.
 
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+Stack :
 
-/* =========================
-   EXPRESS
-========================= */
+livekit-client v2 (, , , RoomLocalParticipantcreateLocalAudioTrackLocalAudioTrack)
+Accroches de réaction
+Le est un standard avec une piste audiottsStreamMediaStream
+Ce que j’ai dans VideoRoom.jsx :
 
-const app = express();
+Une instance (objet de LiveKit) dans un ref : roomRoomroomRef.current
+La piste micro locale est publiée via room.localParticipant.publishTrack(...)
+Un état (booléen)isTranslationActive
+Le arrive via un callback ttsStreamonTtsStream(stream)
+Question / Tâche : Écris-moi la logique React complète pour :
 
-app.get("/", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "Instant Talk Backend v2.1",
-    ws: WS_PATH,
-    models: {
-      stt: OPENAI_STT_MODEL,
-      tts: OPENAI_TTS_MODEL,
-      translation: OPENAI_TRANSLATION_MODEL,
-    },
-  });
-});
+Quand arrive ET : unpublish la piste micro locale, puis publish la piste TTS comme LiveKitttsStreamisTranslationActive === trueLocalAudioTrack
+Quand repasse à : unpublish la piste TTS, puis republish le micro réelisTranslationActivefalse
+Gérer proprement les refs pour éviter les double-publish
+Utiliser les bonnes APIs LiveKit v2 (, , createLocalAudioTrackroom.localParticipant.publishTrackroom.localParticipant.unpublishTrack)
+Donne-moi le code complet du + des fonctions helper à intégrer dans mon composant .useEffectVideoRoom
 
-app.get("/healthz", (req, res) => res.send("ok"));
-
-/* =========================
-   HTTP SERVER
-========================= */
-
-const server = http.createServer(app);
-
-/* =========================
-   WEBSOCKET
-========================= */
-
-const wss = new WebSocketServer({ noServer: true });
-
-server.on("upgrade", (req, socket, head) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  if (url.pathname !== WS_PATH) return socket.destroy();
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
-});
-
-function send(ws, obj) {
-  if (ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify(obj));
-  }
-}
-
-/* =========================
-   AUDIO UTILS
-========================= */
-
-function pcmToWav(pcmBuffer, sampleRate = 16000) {
-  const header = Buffer.alloc(44);
-
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + pcmBuffer.length, 4);
-  header.write("WAVE", 8);
-
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(1, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(sampleRate * 2, 28);
-  header.writeUInt16LE(2, 32);
-  header.writeUInt16LE(16, 34);
-
-  header.write("data", 36);
-  header.writeUInt32LE(pcmBuffer.length, 40);
-
-  return Buffer.concat([header, pcmBuffer]);
-}
-
-/* =========================
-   WS CONNECTION
-========================= */
-
-wss.on("connection", (ws) => {
-  console.log("🟢 Client connecté");
-
-  let audioChunks = [];
-
-  send(ws, { type: "ready" });
-
-  ws.on("message", async (data, isBinary) => {
-    try {
-      if (isBinary) {
-        audioChunks.push(Buffer.from(data));
-        return;
-      }
-
-      const msg = JSON.parse(data.toString());
-
-      /* =========================
-         FLUSH AUDIO
-      ========================= */
-      if (msg.type === "flush") {
-        if (!audioChunks.length) return;
-
-        const pcm = Buffer.concat(audioChunks);
-        audioChunks = [];
-
-        const wav = pcmToWav(pcm);
-        const filePath = path.join(os.tmpdir(), `audio_${Date.now()}.wav`);
-        fs.writeFileSync(filePath, wav);
-
-        /* =========================
-           STT
-        ========================= */
-        const stt = await openai.audio.transcriptions.create({
-          file: fs.createReadStream(filePath),
-          model: OPENAI_STT_MODEL,
-        });
-
-        const text = stt.text || "";
-
-        send(ws, { type: "stt", text });
-
-        /* =========================
-           TRANSLATION
-        ========================= */
-        const trans = await openai.chat.completions.create({
-          model: OPENAI_TRANSLATION_MODEL,
-          messages: [
-            { role: "system", content: "Translate naturally and only return translated text." },
-            { role: "user", content: text },
-          ],
-        });
-
-        const translated = trans.choices[0].message.content.trim();
-
-        send(ws, { type: "translation", text: translated });
-
-        /* =========================
-           TTS
-        ========================= */
-        const tts = await openai.audio.speech.create({
-          model: OPENAI_TTS_MODEL,
-          voice: "alloy",
-          input: translated,
-        });
-
-        const audioBuffer = Buffer.from(await tts.arrayBuffer());
-
-        send(ws, {
-          type: "tts",
-          audio: audioBuffer.toString("base64"),
-        });
-
-        fs.unlinkSync(filePath);
-      }
-    } catch (err) {
-      console.error(err);
-      send(ws, { type: "error", message: err.message });
-    }
-  });
-});
-
-/* =========================
-   START SERVER
-========================= */
-
-server.listen(PORT, () => {
-  console.log("🚀 Backend Instant Talk v2.1");
-  console.log("🌐 Port:", PORT);
-  console.log("🔌 WS:", WS_PATH);
-});
+Colle ça directement dans ChatGPT et envoie-moi le code qu’il génère, je l’intègre immédiatement.
